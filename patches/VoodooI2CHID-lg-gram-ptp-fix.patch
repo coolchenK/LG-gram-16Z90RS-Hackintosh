@@ -1,0 +1,254 @@
+diff --git a/VoodooI2CHID/VoodooI2CHIDDevice.cpp b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+index 9a4edbb..ed84e55 100644
+--- a/VoodooI2CHID/VoodooI2CHIDDevice.cpp
++++ b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+@@ -27,6 +27,9 @@ bool VoodooI2CHIDDevice::init(OSDictionary* properties) {
+     api = NULL;
+     command_gate = NULL;
+     interrupt_simulator = NULL;
++    ptp_fix_timer = NULL;
++    ptp_fix_count = 0;
++    ptp_applying = false;
+     interrupt_source = NULL;
+     ready_for_input = false;
+ 
+@@ -119,15 +122,35 @@ IOReturn VoodooI2CHIDDevice::getHIDDescriptorAddress() {
+     return ret;
+ }
+ 
++// Local diagnostics, read on demand through the VoodooI2CDiag property (vi2ckick diag).
++static uint64_t vi2cReads, vi2cOK, vi2cZero, vi2cErr, vi2cBig, vi2cIrq, vi2cIrqBusy;
++static unsigned vi2cPtpWrites, vi2cLastId;
++static int vi2cLastSize;
++static IOReturn vi2cLastErr;
++
+ void VoodooI2CHIDDevice::getInputReport() {
+     IOBufferMemoryDescriptor* buffer;
+     IOReturn ret;
+     unsigned char* report = (unsigned char *)IOMalloc(hid_descriptor.wMaxInputLength);
+ 
+-    api->readI2C(report, hid_descriptor.wMaxInputLength);
++    IOReturn readRet = api->readI2C(report, hid_descriptor.wMaxInputLength);
+ 
+     int return_size = report[0] | report[1] << 8;
+ 
++    vi2cReads++;
++    if (readRet != kIOReturnSuccess) {
++        vi2cErr++;
++        vi2cLastErr = readRet;
++    } else if (!return_size) {
++        vi2cZero++;
++    } else if (return_size > hid_descriptor.wMaxInputLength) {
++        vi2cBig++;
++    } else {
++        vi2cOK++;
++        vi2cLastSize = return_size;
++        vi2cLastId = return_size > 2 ? report[2] : 0;
++    }
++
+     if (!return_size) {
+         // IOLog("%s::%s Device sent a 0-length report\n", getName(), name);
+         command_gate->commandWakeup(&reset_event);
+@@ -204,7 +227,9 @@ void VoodooI2CHIDDevice::interruptOccured(OSObject* owner, IOInterruptEventSourc
+     if (!awake)
+         return;
+ 
+-    command_gate->attemptAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::getInputReport));
++    vi2cIrq++;
++    if (command_gate->attemptAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::getInputReport)) != kIOReturnSuccess)
++        vi2cIrqBusy++;
+ }
+ 
+ VoodooI2CHIDDevice* VoodooI2CHIDDevice::probe(IOService* provider, SInt32* score) {
+@@ -255,6 +280,12 @@ void VoodooI2CHIDDevice::releaseResources() {
+ 
+     stopInterrupt();
+ 
++    if (ptp_fix_timer) {
++        ptp_fix_timer->cancelTimeout();
++        work_loop->removeEventSource(ptp_fix_timer);
++        OSSafeReleaseNULL(ptp_fix_timer);
++    }
++
+     if (interrupt_simulator) {
+         work_loop->removeEventSource(interrupt_simulator);
+         OSSafeReleaseNULL(interrupt_simulator);
+@@ -395,6 +426,9 @@ IOReturn VoodooI2CHIDDevice::setReport(IOMemoryDescriptor* report, IOHIDReportTy
+     IOFree(arguments, arguments_length);
+     IOFree(orig_buffer, report->getLength());
+ 
++    if (ptp_fix_timer && !ptp_applying && reportType == kIOHIDReportTypeFeature && (options & 0xFF) == 0x03)
++        ptp_fix_timer->setTimeoutMS(500);
++
+     return ret;
+ }
+ 
+@@ -409,6 +443,97 @@ void VoodooI2CHIDDevice::lookupQuirks() {
+     }
+ }
+ 
++void VoodooI2CHIDDevice::applyPTPFeatures() {
++    // Both feature reports carry 2 data bytes (see the report descriptor). setReport() strips the
++    // leading report ID, so pass ID + 2 bytes; a 1-byte payload is silently ignored by the pad.
++    static const UInt8 surface[] = {0x05, 0x03, 0x00};  // Selective Reporting: surface + button switch on
++    static const UInt8 mode[] = {0x03, 0x03, 0x00};     // Input Mode: touchpad
++    const UInt8* reports[] = {surface, mode};
++    ptp_applying = true;
++    for (const UInt8* rep : reports) {
++        IOBufferMemoryDescriptor* md = IOBufferMemoryDescriptor::withBytes(rep, 3, kIODirectionOut);
++        IOReturn r = md ? setReport(md, kIOHIDReportTypeFeature, rep[0]) : kIOReturnNoMemory;
++        OSSafeReleaseNULL(md);
++        IOLog("%s::%s PTP feature %u=0x%02x ret=0x%x\n", getName(), name, rep[0], rep[1], r);
++    }
++    ptp_applying = false;
++    vi2cPtpWrites++;
++}
++
++void VoodooI2CHIDDevice::ptpFixTimerFired(OSObject* owner, IOTimerEventSource* timer) {
++    if (awake)
++        applyPTPFeatures();
++    ptp_fix_count++;
++    if (ptp_fix_count == 1 && ptp_fix_timer)
++        ptp_fix_timer->setTimeoutMS(7000);
++    else if (ptp_fix_count == 2 && ptp_fix_timer)
++        ptp_fix_timer->setTimeoutMS(20000);
++}
++
++IOReturn VoodooI2CHIDDevice::kickPowerOnGated() {
++    return setHIDPowerState(kVoodooI2CStateOn);
++}
++
++IOReturn VoodooI2CHIDDevice::setProperties(OSObject* properties) {
++    OSDictionary* dict = OSDynamicCast(OSDictionary, properties);
++    if (dict && command_gate) {
++        if (dict->getObject("VoodooI2CDiag")) {
++            char buf[320];
++            snprintf(buf, sizeof(buf), "reads=%llu ok=%llu zero=%llu err=%llu oversize=%llu irq=%llu irqBusy=%llu "
++                     "lastSize=%d lastId=0x%02x lastErr=0x%x ptpWrites=%u polling=%d awake=%d",
++                     vi2cReads, vi2cOK, vi2cZero, vi2cErr, vi2cBig, vi2cIrq, vi2cIrqBusy,
++                     vi2cLastSize, vi2cLastId, vi2cLastErr, vi2cPtpWrites, interrupt_simulator ? 1 : 0, awake ? 1 : 0);
++            setProperty("VoodooI2CDiagStats", buf);
++            return kIOReturnSuccess;
++        }
++        if (OSNumber* kick = OSDynamicCast(OSNumber, dict->getObject("VoodooI2CKick"))) {
++            unsigned k = kick->unsigned32BitValue();
++            IOReturn r = kIOReturnUnsupported;
++            if (k == 1)
++                r = command_gate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::kickPowerOnGated));
++            else if (k == 2)
++                r = resetHIDDevice();
++            IOLog("VoodooI2CHIDKick::%s kick=%u ret=0x%x\n", name, k, r);
++            setProperty("VoodooI2CKickResult", r, 32);
++            return kIOReturnSuccess;
++        }
++        if (OSData* feat = OSDynamicCast(OSData, dict->getObject("VoodooI2CSetFeature"))) {
++            IOReturn r = kIOReturnBadArgument;
++            if (feat->getLength() >= 2) {
++                const UInt8* b = reinterpret_cast<const UInt8*>(feat->getBytesNoCopy());
++                IOBufferMemoryDescriptor* md = IOBufferMemoryDescriptor::withBytes(b, feat->getLength(), kIODirectionOut);
++                if (md) {
++                    r = setReport(md, kIOHIDReportTypeFeature, b[0]);
++                    md->release();
++                }
++                IOLog("VoodooI2CHIDKick::%s setFeature id=%u len=%u ret=0x%x\n", name, b[0], feat->getLength(), r);
++            }
++            setProperty("VoodooI2CKickResult", r, 32);
++            return kIOReturnSuccess;
++        }
++        if (OSNumber* gid = OSDynamicCast(OSNumber, dict->getObject("VoodooI2CGetFeature"))) {
++            UInt8 id = gid->unsigned8BitValue();
++            IOReturn r = kIOReturnNoMemory;
++            IOBufferMemoryDescriptor* md = IOBufferMemoryDescriptor::withCapacity(64, kIODirectionIn);
++            if (md) {
++                md->setLength(64);
++                bzero(md->getBytesNoCopy(), 64);
++                r = getReport(md, kIOHIDReportTypeFeature, id);
++                OSData* data = OSData::withBytes(md->getBytesNoCopy(), (unsigned)md->getLength());
++                if (data) {
++                    setProperty("VoodooI2CLastFeature", data);
++                    data->release();
++                }
++                md->release();
++            }
++            IOLog("VoodooI2CHIDKick::%s getFeature id=%u ret=0x%x\n", name, id, r);
++            setProperty("VoodooI2CKickResult", r, 32);
++            return kIOReturnSuccess;
++        }
++    }
++    return super::setProperties(properties);
++}
++
+ IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService* whatDevice) {
+     if (whatDevice != this)
+         return kIOReturnInvalid;
+@@ -427,6 +552,11 @@ IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService*
+ 
+             startInterrupt();
+ 
++            if (ptp_fix_timer) {
++                ptp_fix_count = 1;
++                ptp_fix_timer->setTimeoutMS(1500);
++            }
++
+             if (quirks & I2C_HID_QUIRK_RESET_ON_RESUME) {
+                 resetHIDDevice();
+             } else {
+@@ -491,6 +621,20 @@ bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
+     api->joinPMtree(this);
+     registerPowerDriver(this, VoodooI2CIOPMPowerStates, kVoodooI2CIOPMNumberPowerStates);
+ 
++    // Local change (LG gram TOPS0102, VID 0x35cc): the pad comes up with Selective
++    // Reporting (feature 5: surface/button switch) off, and sometimes ignores the early
++    // Input Mode write, so it stays silent. Windows/Linux set both; do it 3 s and 10 s
++    // after start and again after wake.
++    if (hid_descriptor.wVendorID == 0x35cc) {
++        ptp_fix_timer = IOTimerEventSource::timerEventSource(this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &VoodooI2CHIDDevice::ptpFixTimerFired));
++        if (ptp_fix_timer && work_loop->addEventSource(ptp_fix_timer) == kIOReturnSuccess) {
++            ptp_fix_count = 0;
++            ptp_fix_timer->setTimeoutMS(3000);
++        } else {
++            OSSafeReleaseNULL(ptp_fix_timer);
++        }
++    }
++
+     // Give the reset a bit of time so that IOHIDDevice doesnt happen to start requesting the report
+     // descriptor before the driver is ready
+ 
+diff --git a/VoodooI2CHID/VoodooI2CHIDDevice.hpp b/VoodooI2CHID/VoodooI2CHIDDevice.hpp
+index e720658..ebe7536 100644
+--- a/VoodooI2CHID/VoodooI2CHIDDevice.hpp
++++ b/VoodooI2CHID/VoodooI2CHIDDevice.hpp
+@@ -265,6 +265,10 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
+ 
+     IOReturn setPowerState(unsigned long whichState, IOService* whatDevice) override;
+ 
++    // Local change: runtime test hooks driven by IORegistry properties (VoodooI2CKick,
++    // VoodooI2CSetFeature, VoodooI2CGetFeature).
++    IOReturn setProperties(OSObject* properties) override;
++
+     /* Issues an I2C-HID set report command.
+      * @report The report data to be sent to the device
+      * @reportType The type of HID report to be sent
+@@ -288,6 +292,9 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
+     UInt16 hid_descriptor_register;
+     IOTimerEventSource* interrupt_simulator;
+     IOInterruptEventSource* interrupt_source;
++    IOTimerEventSource* ptp_fix_timer;
++    int ptp_fix_count;
++    bool ptp_applying;
+     bool ready_for_input;
+     bool* reset_event;
+     bool is_interrupt_started = false;
+@@ -317,6 +324,12 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
+     void startInterrupt();
+ 
+     void stopInterrupt();
++
++    IOReturn kickPowerOnGated();
++
++    void applyPTPFeatures();
++
++    void ptpFixTimerFired(OSObject* owner, IOTimerEventSource* timer);
+ };
+ 
+ 

@@ -1,0 +1,2621 @@
+diff --git a/WhateverXe/kern_alderlake_n.hpp b/WhateverXe/kern_alderlake_n.hpp
+index 11c6803..e3b62de 100644
+--- a/WhateverXe/kern_alderlake_n.hpp
++++ b/WhateverXe/kern_alderlake_n.hpp
+@@ -1,679 +1,695 @@
+-// ADL-N/Twin Lake identity and fuse-derived small GT profile.
+-// Runtime qualification remains separate from PCI family recognition.
+-// Linux v6.12 intel_display_power_map.c / i915_reg.h provide Display 13
+-// register definitions. TGL donor startup remains blocked until separately
+-// qualified; recognizing this profile does not make the donor safe to start.
+-#ifndef kern_alderlake_n_hpp
+-#define kern_alderlake_n_hpp
+-#include <stdint.h>
+-#include "kern_xelp_platform.hpp"
+-#include "kern_xelp_gt_resources.hpp"
+-#include "kern_xelp_memory_layout.hpp"
+-#include "kern_xelp_geometry.hpp"
+-#include <stddef.h>
+-#include "kern_display13_power_bridge.hpp"
+-#include "kern_display13_clock.hpp"
+-#include "kern_display13_tc.hpp"
+-
+-namespace AlderLakeN {
+-constexpr uint32_t Identity = 0x46D18086;
+-constexpr uint32_t DisplayVersion = 13;
+-constexpr uint32_t GraphicsStep = 0; // A0, separate stepping domain.
+-constexpr uint32_t DisplayStep = 3;  // D0 in the ADL-N revision table.
+-
+-// Linux v6.12 INTEL_ADLN_IDS includes Twin Lake 46D3/46D4. Do not infer
+-// EU count from these IDs, and do not admit other ADL-P devices here.
+-inline bool family(uint32_t identity) {
+-    return XELP::identify(identity,0).family==XELP::Family::AlderLakeN;
+-}
+-inline bool matches(uint32_t identity, uint8_t revision) {
+-    // Revision identifies the hardware; untested revisions use the family backend.
+-    const auto p=XELP::identify(identity,revision);
+-    return p.family==XELP::Family::AlderLakeN && p.admitted();
+-}
+-
+-using Resources=XELP::SmallGTResources;
+-using XELP::smallGTResources;
+-inline bool resources(uint32_t slice,uint32_t dss,uint32_t euDisable,uint32_t l3Disable,Resources &out) {
+-    return smallGTResources(slice,dss,euDisable,l3Disable,out);
+-}
+-
+-struct Register { uint32_t offset {}, value {}; };
+-enum class GTStatus : uint32_t {
+-    NotAdmitted, ExistingOwner, AckTimeout, Unavailable, ProfileMismatch, ReleaseFailed, Complete
+-};
+-struct GTReadout {
+-    uint32_t version {1};
+-    GTStatus status {GTStatus::NotAdmitted};
+-    uint32_t writes {}, requestedMask {}, releasedMask {}, releaseFailedMask {};
+-    uint32_t requestBefore[2] {}, ackBefore[2] {}, ackHeld[2] {}, requestAfter[2] {}, ackAfter[2] {};
+-    uint32_t fuses[5] {};
+-    Resources resources;
+-    uint32_t count {};
+-    Register registers[16] {};
+-};
+-static_assert(sizeof(GTReadout)==60*4,"AlderLakeN GT readout layout");
+-
+-// Linux v6.12 gen12 forcewake domains: fuses and BCS are GT, RCS is render.
+-// Only acquire an unowned kernel bit0. Never reset domains or alter engines.
+-template<class IO> GTReadout readGT(IO &io, bool admitted, uint32_t *edram=nullptr,
+-    bool (*decode)(const uint32_t *,Resources &)=nullptr) {
+-    GTReadout out;
+-    if(!admitted)return out;
+-    constexpr uint32_t request[] {0xA188,0xA278},ack[] {0x130044,0xD84};
+-    constexpr uint32_t fuse[] {0x9138,0x913C,0x9134,0x9118,0x9140};
+-    constexpr uint32_t engine[] {0x2030,0x2034,0x2038,0x203C,0x209C,0x2234,0x2238,0x229C,
+-        0x22030,0x22034,0x22038,0x2203C,0x2209C,0x22234,0x22238,0x2229C};
+-    out.status=GTStatus::Unavailable;
+-    for(unsigned d=0;d<2;++d)if(!io.readable(request[d]) || !io.readable(ack[d]))return out;
+-    for(auto reg:fuse)if(!io.readable(reg))return out;
+-    for(auto reg:engine)if(!io.readable(reg))return out;
+-    for(unsigned d=0;d<2;++d) {
+-        out.requestBefore[d]=io.read(request[d]);out.ackBefore[d]=io.read(ack[d]);
+-        if(out.requestBefore[d]==UINT32_MAX || out.ackBefore[d]==UINT32_MAX)return out;
+-        if((out.requestBefore[d]|out.ackBefore[d])&1) {out.status=GTStatus::ExistingOwner;return out;}
+-    }
+-    const auto wait=[&](unsigned d,bool held,uint32_t &last) {
+-        for(unsigned n=0;n<500;++n) {
+-            last=io.read(ack[d]);
+-            if(last==UINT32_MAX)return false;
+-            if(bool(last&1)==held)return true;
+-            io.delay(); // 100us, bounded to Linux's 50ms ACK timeout.
+-        }
+-        return false;
+-    };
+-    for(unsigned d=0;d<2;++d) {
+-        io.write(request[d],0x00010001);++out.writes;out.requestedMask|=1U<<d;
+-        io.read(request[d]);
+-    }
+-    out.status=GTStatus::AckTimeout;
+-    bool held=true;
+-    for(unsigned d=0;d<2;++d)if(!wait(d,true,out.ackHeld[d]))held=false;
+-    if(out.ackHeld[0]==UINT32_MAX || out.ackHeld[1]==UINT32_MAX)out.status=GTStatus::Unavailable;
+-    if(held) {
+-        out.status=GTStatus::Complete;
+-        for(unsigned i=0;i<5;++i) {
+-            out.fuses[i]=io.read(fuse[i]);
+-            if(out.fuses[i]==UINT32_MAX)out.status=GTStatus::Unavailable;
+-        }
+-        if(out.status==GTStatus::Complete &&
+-           !(decode ? decode(out.fuses,out.resources) :
+-             (resources(out.fuses[0],out.fuses[1],out.fuses[2],out.fuses[3],out.resources) &&
+-              out.fuses[4]==0x000E00FE)))out.status=GTStatus::ProfileMismatch;
+-        if(edram) {
+-            *edram=io.readable(0x120010) ? io.read(0x120010) : UINT32_MAX;
+-            if(*edram==UINT32_MAX)out.status=GTStatus::Unavailable;
+-        }
+-        for(auto reg:engine) {
+-            const auto value=io.read(reg);out.registers[out.count++]={reg,value};
+-            if(value==UINT32_MAX)out.status=GTStatus::Unavailable;
+-        }
+-    }
+-    for(int d=1;d>=0;--d) {
+-        io.write(request[d],0x00010000);++out.writes;
+-        out.requestAfter[d]=io.read(request[d]);
+-        // Upper16 are the masked-write enable field, not client ownership.
+-        if(wait(unsigned(d),false,out.ackAfter[d]) &&
+-           (out.requestAfter[d]&0xFFFF)==(out.requestBefore[d]&0xFFFF))
+-            out.releasedMask|=1U<<d;
+-        else out.releaseFailedMask|=1U<<d;
+-    }
+-    if(out.releaseFailedMask)out.status=GTStatus::ReleaseFailed;
+-    return out;
+-}
+-enum class ReadoutStatus : uint32_t { NotAdmitted, Complete, Unavailable, PowerChanged };
+-struct DisplayReadout {
+-    uint32_t version {2};
+-    ReadoutStatus status {ReadoutStatus::NotAdmitted};
+-    uint32_t count {}, poweredPipes {}, activePipes {}, hdmiBPipes {};
+-    Register registers[160] {};
+-};
+-
+-// Read only. Check Display 13 PW_A/B/C before pipe-local registers; do not
+-// access TGL FIA/TC/Dekel addresses or issue selector/power/MMIO writes.
+-template<class IO> void readDisplay(IO &io, bool admitted, DisplayReadout &r) {
+-    // Reused storage must not retain pipe bits or registers from an earlier
+-    // snapshot. Reset fields in place: aggregate assignment can itself reserve
+-    // a full DisplayReadout temporary on the unoptimized kernel stack.
+-    r.version=2;r.status=ReadoutStatus::NotAdmitted;
+-    r.count=r.poweredPipes=r.activePipes=r.hdmiBPipes=0;
+-    for(auto &reg:r.registers) {reg.offset=0;reg.value=0;}
+-    if (!admitted) return;
+-    const auto add = [&](uint32_t offset) {
+-        if (r.count >= sizeof(r.registers) / sizeof(r.registers[0]) || !io.readable(offset)) {
+-            r.status = ReadoutStatus::Unavailable;
+-            return UINT32_MAX;
+-        }
+-        const uint32_t value = io.read(offset);
+-        r.registers[r.count++] = {offset, value};
+-        if (value == UINT32_MAX) r.status = ReadoutStatus::Unavailable;
+-        return value;
+-    };
+-    r.status = ReadoutStatus::Complete;
+-    const uint32_t power = add(0x45404);
+-    if (r.status != ReadoutStatus::Complete) return;
+-    // Always-on / PW1 display state, including BIOS and DDI I/O ownership.
+-    const uint32_t common[] {0x45400, 0x45408, 0x4540C, 0x45450, 0x45454, 0x4545C,
+-        0x45420, 0x45424, 0x45444, 0x42000, 0x42084,
+-        0x44300, 0x4438C, 0x45008, 0x4500C, 0x45010, 0x45014,
+-        0x46000, 0x46004, 0x164280, 0x164284, 0x164288, 0x16428C,
+-        0x64000, 0x64100, 0x64200};
+-    for (auto offset : common) add(offset);
+-    for (unsigned pipe = 0; pipe < 3; ++pipe) {
+-        // XELPD_PW_CTL_IDX_PW_A = 5, B = 6, C = 7; state bit = 2*idx.
+-        if (!(power & (1U << (2 * (5 + pipe))))) continue;
+-        r.poweredPipes |= 1U << pipe;
+-        const auto func = add(0x60400 + 0x1000 * pipe);
+-        if (func != UINT32_MAX && (func & 0x80000000)) {
+-            r.activePipes |= 1U << pipe;
+-            // TGL+ uses (port + 1) in bits30:27. B is encoded as 2.
+-            if (((func >> 27) & 15) == 2 && ((func >> 24) & 7) <= 1)
+-                r.hdmiBPipes |= 1U << pipe;
+-        }
+-        const uint32_t local[] {0x60000, 0x60004, 0x60008, 0x6000C, 0x60010,
+-            0x60014, 0x6001C, 0x70008, 0x70028, 0x70040, 0x70080, 0x70084,
+-            0x70180, 0x70188, 0x7018C, 0x70190, 0x7019C, 0x701A4, 0x701AC,
+-            0x7027C, 0x7037C, 0x70280, 0x70380, 0x70480, 0x70580, 0x70680, 0x70780};
+-        for (auto offset : local) add(offset + 0x1000 * pipe);
+-        // TGL+ DP transport is transcoder-indexed, not DDI-indexed. M2/N2
+-        // are absent on Display13 (Linux intel_cpu_transcoder_has_m2_n2).
+-        const uint32_t transport[] {0x60404,0x60540,0x60030,0x60034,0x60040,0x60044};
+-        for (auto offset : transport)
+-            add(offset + 0x1000 * pipe);
+-        add(0x46140 + 4 * pipe);
+-        // Display11+ has two scalers per powered pipe (Linux display runtime).
+-        // Capture the binding and destination, without touching power/coefficients.
+-        for(unsigned scaler=0;scaler<2;++scaler) {
+-            const auto base=0x68170+0x800*pipe+0x100*scaler;
+-            add(base);add(base+4);add(base+0x10);
+-        }
+-        // Display13 DSC/joiner belongs to the corresponding pipe well.
+-        add(0x78000 + 0x200 * pipe);add(0x78004 + 0x200 * pipe);
+-    }
+-    const auto after = add(0x45404);
+-    if (r.status == ReadoutStatus::Complete && after != power)
+-        r.status = ReadoutStatus::PowerChanged;
+-}
+-// Value-returning callers retain the existing API. Early bootstrap uses the
+-// in-place overload with one allocated snapshot instead of stacked copies.
+-template<class IO> DisplayReadout readDisplay(IO &io, bool admitted) {
+-    DisplayReadout r;
+-    readDisplay(io,admitted,r);
+-    return r;
+-}
+-
+-inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
+-    if (r.count > sizeof(r.registers) / sizeof(r.registers[0])) return false;
+-    for (uint32_t i=0; i<r.count; ++i)
+-        if (r.registers[i].offset==offset) { out=r.registers[i].value; return out!=UINT32_MAX; }
+-    return false;
+-}
+-
+-// Source-side certificate for an already-running, uncompressed external SST
+-// GOP. This does not prove sink DPCD state, PLL rate or native AUX ownership.
+-inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const Display13TC::Boot *tc=nullptr,bool panel=false) {
+-    const bool typeC=ddi>=3 && ddi<=6;
+-    if((panel && ddi>=2) || pipe>=3 || (ddi>=2 && !typeC) || boot.status!=ReadoutStatus::Complete ||
+-       !(boot.activePipes&boot.poweredPipes&(1U<<pipe)))return false;
+-    const auto bank=pipe*0x1000;
+-    uint32_t trans=0,tp=0,buf=0,clock=0,ctl2=0,dss1=0,dss2=0,dm=0,dn=0,lm=0,ln=0;
+-    // TC buffer access needs the separate powered TCSS/ownership witness.
+-    // Do not add every TC register to the unconditional common readout.
+-    if(typeC) {
+-        uint32_t power=0,ddiPower=0;
+-        if(!tc || !tc->valid() || tc->port.ddi!=ddi || tc->pipe!=pipe ||
+-           !value(boot,0x45404,power) || power!=tc->power ||
+-           !value(boot,0x45454,ddiPower) || ddiPower!=tc->ddiPower)return false;
+-        buf=tc->buffer;
+-    } else if(!value(boot,0x64000+ddi*0x100,buf))return false;
+-    if(!value(boot,0x60400+bank,trans) || !value(boot,0x60540+bank,tp) ||
+-       !value(boot,0x46140+4*pipe,clock) ||
+-       !value(boot,0x60404+bank,ctl2) || !value(boot,0x78000+pipe*0x200,dss1) ||
+-       !value(boot,0x78004+pipe*0x200,dss2) || !value(boot,0x60030+bank,dm) ||
+-       !value(boot,0x60034+bank,dn) || !value(boot,0x60040+bank,lm) ||
+-       !value(boot,0x60044+bank,ln))return false;
+-    const unsigned lanes=((trans>>1)&7)+1;
+-    // Linux v6.12 i915_reg.h: SST, normal training, scrambling, no FEC/MST,
+-    // port sync, HDCP, DSC or joined pipes. Enhanced framing may be on or off.
+-    // intel_ddi_read_func_ctl classifies SST from MODE_SELECT, not the MST
+-    // payload-allocation bit. Firmware may leave bit8 set on an SST GOP;
+-    // preserve it and include it in the unchanged-source check, never clear it
+-    // on an enabled transcoder or infer an MST transport from that bit alone.
+-    return (trans&0xFF700000U)==(0x82000000U|((ddi+1)<<27)) &&
+-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+-        (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
+-        (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
+-            (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&
+-        (clock>>28)==ddi+(typeC?3:1) && (!typeC || clock==tc->transClock) &&
+-        (tp&~((1U<<18)|(panel?1U<<6:0)))==0x80000300U &&
+-        !(dss1&0xF0300000U) && !(dss2&0x80008000U) &&
+-        !(dm&0x81000000U) && (dm&0xFFFFFF) &&
+-        dn && !(dn&0xFF000000U) && lm && !(lm&0xFF000000U) && ln && !(ln&0xFF000000U) &&
+-        (dm&0xFFFFFF)<=dn;
+-}
+-enum class GOPProtocol : uint32_t {TMDS,DP,EDP};
+-// Source and power must remain unchanged while only the plane is reinitialized.
+-// This is an early, serialized bootstrap transaction, not a modeset or link
+-// adoption certificate. A changed link stops further writes, including rollback.
+-template<class IO> bool dpSourceUnchanged(IO &io,const DisplayReadout &r,unsigned pipe,unsigned ddi,
+-                                         uint32_t addedAUXRequest=0,const Display13TC::Boot *tc=nullptr,bool panel=false) {
+-    // addedAUXRequest is the existing Combo boot-lease transition only.
+-    // TC lifetime uses Mode's own AUX lease, not the Combo MainLinkAUX slot.
+-    if(!dpSource(r,pipe,ddi,tc,panel) || (addedAUXRequest && (ddi>=2 || addedAUXRequest!=(2U<<(2*ddi)))))return false;
+-    if(ddi>=3 && !tc->unchanged(io))return false;
+-    const uint32_t bank=pipe*0x1000;
+-    // Recheck power before touching pipe-local registers. A captured snapshot
+-    // is not permission to read a bank whose well has since disappeared.
+-    const uint32_t regs[] {0x45404,0x45454,0x45444,0x42000,
+-        0x60400+bank,0x60404+bank,0x60540+bank,0x60030+bank,0x60034+bank,
+-        0x60040+bank,0x60044+bank,0x70008+bank,0x46140+4*pipe,0x64000+0x100*ddi,
+-        0x78000+0x200*pipe,0x78004+0x200*pipe};
+-    for(auto reg:regs) {
+-        uint32_t expected=0;
+-        if(ddi>=3 && reg==0x64000+0x100*ddi)expected=tc->buffer;
+-        else if(!value(r,reg,expected))return false;
+-        if(!io.readable(reg))return false;
+-        if(reg==Display13Power::AUX)expected|=addedAUXRequest;
+-        if(io.read(reg)!=expected)return false;
+-    }
+-    return true;
+-}
+-// The GOP is already driving DP. Keep its physical AUX domain on without
+-// inventing a native transaction reference or claiming the firmware request.
+-// Caller holds the display owner lock throughout both proof and acquisition.
+-template<class IO> Display13Power::Result holdDPBootAUX(IO &io,const DisplayReadout &boot,
+-    Display13Power::NativeBridge &bridge,Display13Power::MainLinkAUX &link,unsigned ddi,bool panel=false) {
+-    using namespace Display13Power;Result r;
+-    if(ddi>=2 || boot.activePipes!=1 || !dpSource(boot,0,ddi,nullptr,panel) || !dpSourceUnchanged(io,boot,0,ddi,0,nullptr,panel) ||
+-       bridge.bootPort!=ddi || bridge.bootAdopted || !bridge.bootPGProtected || !bridge.bootDDIProtected ||
+-       !bridge.outputHeld(io,ddi,0) || link.owner || link.bootPending || link.lease.owner)return r;
+-    uint32_t aux=0;
+-    if(!value(boot,AUX,aux) || !(aux&(1U<<(2*ddi))))return r; // No active-link cold power-up.
+-    r=acquire(io,bridge.state,link.lease,auxDomain(ddi));
+-    if(r.status!=Status::Complete)return r;
+-    link.port=ddi;link.bootPending=true;
+-    if(!dpSourceUnchanged(io,boot,0,ddi,2U<<(2*ddi),nullptr,panel) || !held(io,bridge.state,link.lease.domains)) {
+-        // Do not release a newly acquired request under a still-active GOP.
+-        bridge.state.faulted=true;r.status=Status::RequestLost;
+-    }
+-    return r;
+-}
+-// Bind the protected lease to the actual, independently validated native port.
+-// The caller retains that object on success and then adopts the boot path.
+-// No hardware request or native AUX transaction counter changes at handoff.
+-template<class IO> Display13Power::Result adoptDPBootAUX(IO &io,const DisplayReadout &boot,
+-    Display13Power::NativeBridge &bridge,Display13Power::MainLinkAUX &link,uintptr_t target,unsigned ddi,bool panel=false) {
+-    using namespace Display13Power;Result r;
+-    if(!target || ddi>=2 || boot.activePipes!=1 || !dpSource(boot,0,ddi,nullptr,panel) || !dpSourceUnchanged(io,boot,0,ddi,0,nullptr,panel) ||
+-       bridge.bootPort!=ddi || bridge.bootAdopted || !bridge.bootPGProtected || !bridge.bootDDIProtected ||
+-       !bridge.outputHeld(io,ddi,0) || !link.bootPending || link.owner || link.port!=ddi ||
+-       link.lease.owner!=&bridge.state || link.lease.domains!=dependencies(auxDomain(ddi)) ||
+-       !held(io,bridge.state,link.lease.domains))return r;
+-    link.owner=target;link.bootPending=false;r.status=Status::Complete;return r;
+-}
+-enum class LinearStatus : uint32_t {
+-    NotAdmitted, Ready, Success, NotSingleHDMI, NotLinearFHD, OtherPlaneActive,
+-    StateChanged, NoVblank, DisableTimeout, EnableTimeout, RollbackFailed, InvalidDPSource, InvalidTCSource
+-};
+-struct LinearPlan {
+-    uint32_t pipe {}, chicken {}, arb {}, control {}, stride {}, position {}, size {}, offset {}, surface {};
+-    XELPGeometry::Linear geometry;
+-};
+-struct LinearResult {
+-    uint32_t version {1};
+-    LinearStatus status {LinearStatus::NotAdmitted};
+-    uint32_t pipe {}, writes {}, framesBefore {}, framesAfter {}, restored {};
+-};
+-
+-// Qualify a firmware pipe scaler separately from an unscaled linear GOP.
+-// PIPESRC is width:height minus one; scaler WIN_SZ is width:height, not
+-// minus one. Only one pipe-bound scaler covering the complete output is
+-// accepted. Plane-bound/planar/programmed-factor scaling is not this contract.
+-inline bool bootGeometry(const DisplayReadout &r,unsigned pipe,const XELPGeometry::Linear &geometry,
+-                         uint32_t ht,uint32_t vt) {
+-    if(XELPGeometry::timing(geometry,ht,vt))return true;
+-    if(!geometry.valid || pipe>=3 || ht==UINT32_MAX || vt==UINT32_MAX ||
+-       (ht&0xC000C000) || (vt&0xC000C000))return false;
+-    uint32_t src=0;
+-    if(!value(r,0x6001C+0x1000*pipe,src) ||
+-       src!=(((geometry.width-1)<<16)|(geometry.height-1)))return false;
+-    const auto width=(ht&0x3FFF)+1,height=(vt&0x3FFF)+1;
+-    if(((ht>>16)&0x3FFF)+1<width || ((vt>>16)&0x3FFF)+1<height ||
+-       width<geometry.width || height<geometry.height)return false;
+-    unsigned active=0;
+-    for(unsigned scaler=0;scaler<2;++scaler) {
+-        const auto base=0x68170+0x800*pipe+0x100*scaler;
+-        uint32_t ctl=0,pos=0,size=0;
+-        if(!value(r,base+0x10,ctl) || !value(r,base,pos) || !value(r,base+4,size))return false;
+-        if(!(ctl&0x80000000U))continue;
+-        if((ctl&((7U<<25)|(1U<<29)|(1U<<19))) || pos || size!=((width<<16)|height))return false;
+-        ++active;
+-    }
+-    return active==1;
+-}
+-template<class IO> bool bootGeometryUnchanged(IO &io,const DisplayReadout &r,unsigned pipe) {
+-    // The accepted scaler stays live while the primary plane changes GGTT mode.
+-    // Any captured source/timing/scaler drift invalidates the handoff.
+-    const uint32_t regs[] {0x60000+0x1000*pipe,0x6000C+0x1000*pipe,0x6001C+0x1000*pipe,
+-        0x68170+0x800*pipe,0x68174+0x800*pipe,0x68180+0x800*pipe,
+-        0x68270+0x800*pipe,0x68274+0x800*pipe,0x68280+0x800*pipe};
+-    for(auto reg:regs) {uint32_t v=0;if(value(r,reg,v) && io.read(reg)!=v)return false;}
+-    return true;
+-}
+-
+-// First Display 13 operation: reinitialize an existing linear RGB primary
+-// plane on the explicitly selected Combo, or fixed TC with a live link
+-// certificate. The default remains B for
+-// the original standalone diagnostics. No new PLL/PHY/power-well cold
+-// initialization, a new GGTT mapping, full modeset or accelerated scanout.
+-inline LinearStatus linearPlan(const DisplayReadout &r, LinearPlan &p,unsigned ddi=1,GOPProtocol protocol=GOPProtocol::TMDS,
+-                               const Display13TC::Boot *tc=nullptr) {
+-    p={};
+-    if (ddi>=7 || r.status!=ReadoutStatus::Complete || !r.activePipes || (r.activePipes&~7U) ||
+-        (r.activePipes & (r.activePipes-1)) || (r.activePipes&~r.poweredPipes) ||
+-        (protocol!=GOPProtocol::TMDS && protocol!=GOPProtocol::DP && protocol!=GOPProtocol::EDP) ||
+-        (protocol==GOPProtocol::TMDS && ddi==1 && r.activePipes!=r.hdmiBPipes))
+-        return LinearStatus::NotSingleHDMI;
+-    while (!(r.activePipes & (1U<<p.pipe))) ++p.pipe;
+-    if (p.pipe>=3) return LinearStatus::NotSingleHDMI;
+-    if(ddi>=3 && (!tc || !tc->valid() || tc->port.ddi!=ddi || tc->pipe!=p.pipe ||
+-       (protocol!=GOPProtocol::DP && tc->ownershipOptional)))
+-        return LinearStatus::InvalidTCSource;
+-    const uint32_t delta=0x1000*p.pipe;
+-    uint32_t trans {}, cursor {}, surfLive {}, plane {}, pipeConf {}, htotal {}, vtotal {};
+-    if (!value(r,0x42084,p.chicken) || !value(r,0x70028+delta,p.arb) ||
+-        !value(r,0x70180+delta,p.control) || !value(r,0x70188+delta,p.stride) ||
+-        !value(r,0x7018C+delta,p.position) || !value(r,0x70190+delta,p.size) ||
+-        !value(r,0x701A4+delta,p.offset) || !value(r,0x7019C+delta,p.surface) ||
+-        !value(r,0x701AC+delta,surfLive) || !value(r,0x60400+delta,trans) ||
+-        !value(r,0x70008+delta,pipeConf) || !value(r,0x60000+delta,htotal) || !value(r,0x6000C+delta,vtotal))
+-        return LinearStatus::NotLinearFHD;
+-    if(!(trans&(1U<<31)) || ((trans>>27)&15)!=ddi+1 ||
+-       (protocol==GOPProtocol::TMDS && ((trans>>24)&7)>1))
+-        return LinearStatus::NotSingleHDMI;
+-    if(protocol!=GOPProtocol::TMDS && !dpSource(r,p.pipe,ddi,tc,protocol==GOPProtocol::EDP))return LinearStatus::InvalidDPSource;
+-    p.geometry=XELPGeometry::linear(p.control,p.stride,p.size,p.position,p.offset);
+-    if(!p.geometry.valid || (p.surface&4095) || p.surface!=surfLive ||
+-       ((trans>>20)&7)!=0 || (pipeConf&0xC0000000)!=0xC0000000 ||
+-       !bootGeometry(r,p.pipe,p.geometry,htotal,vtotal))return LinearStatus::NotLinearFHD;
+-    // DPT disable is global on Display 13. Exclude all other active planes
+-    // and cursors, including planes on powered but inactive pipes.
+-    for (unsigned pipe=0;pipe<3;++pipe) {
+-        if (!(r.poweredPipes & (1U<<pipe))) continue;
+-        const auto d=0x1000*pipe;
+-        if (!value(r,0x70080+d,cursor) || (cursor & 0x3f))
+-            return LinearStatus::OtherPlaneActive;
+-        if (pipe!=p.pipe && (!value(r,0x70180+d,plane) || (plane & 0x80000000)))
+-            return LinearStatus::OtherPlaneActive;
+-        for (unsigned n=2;n<=7;++n)
+-            if (!value(r,0x70080+0x100*n+d,plane) || (plane & 0x80000000))
+-                return LinearStatus::OtherPlaneActive;
+-    }
+-    return LinearStatus::Ready;
+-}
+-
+-template<class IO> LinearResult reinitializeLinear(IO &io, const DisplayReadout &r, bool admitted,unsigned ddi=1,
+-                                                  GOPProtocol protocol=GOPProtocol::TMDS,const Display13TC::Boot *tc=nullptr) {
+-    LinearResult out;
+-    if (!admitted) return out;
+-    LinearPlan p;
+-    out.status=linearPlan(r,p,ddi,protocol,tc);
+-    if(out.status!=LinearStatus::Ready)return out;
+-    out.pipe=p.pipe;
+-    const auto d=0x1000*p.pipe;
+-    const uint32_t ctl=0x70180+d, surf=0x7019C+d, frame=0x70040+d;
+-    const auto write=[&](uint32_t reg,uint32_t v){io.write(reg,v);++out.writes;io.read(reg);};
+-    bool linkChanged=false;
+-    const auto linkStable=[&] {
+-        if(!bootGeometryUnchanged(io,r,p.pipe))linkChanged=true;
+-        if(protocol!=GOPProtocol::TMDS && !dpSourceUnchanged(io,r,p.pipe,ddi,0,tc,protocol==GOPProtocol::EDP))linkChanged=true;
+-        if(ddi>=3 && (!tc || !tc->unchanged(io)))linkChanged=true;
+-        return !linkChanged;
+-    };
+-    // Check all captured words used by the transaction before the first write.
+-    uint32_t trans=0;value(r,0x60400+d,trans);
+-    const Register expected[] {{0x60400+d,trans},{0x42084,p.chicken},{0x70028+d,p.arb},{ctl,p.control},
+-        {0x70188+d,p.stride},{0x7018C+d,p.position},{0x70190+d,p.size},
+-        {0x701A4+d,p.offset},{surf,p.surface}};
+-    for(auto pair:expected)if(io.read(pair.offset)!=pair.value){out.status=LinearStatus::StateChanged;return out;}
+-    if(!linkStable()){out.status=LinearStatus::StateChanged;return out;}
+-    const auto waitFrames=[&](uint32_t start) {
+-        for(unsigned i=0;i<1000;++i) {
+-            if(!linkStable())return false;
+-            const auto now=io.read(frame);
+-            if(now==UINT32_MAX)return false;
+-            if(uint32_t(now-start)>=2 && uint32_t(now-start)<0x10000000)return true;
+-            io.delay(); // 100us; at most100ms at the qualified FHD60 timing.
+-        }
+-        return false;
+-    };
+-    out.framesBefore=io.read(frame);
+-    if(out.framesBefore==UINT32_MAX || !waitFrames(out.framesBefore)) {
+-        out.status=linkChanged ? LinearStatus::StateChanged : LinearStatus::NoVblank;return out;
+-    }
+-    const auto rollback=[&] {
+-        if(!linkStable()){out.status=LinearStatus::StateChanged;return;}
+-        write(ctl,p.control & ~0x80000000U);write(surf,p.surface);
+-        const bool stopped=waitFrames(io.read(frame));
+-        if(linkChanged){out.status=LinearStatus::StateChanged;return;}
+-        write(0x42084,p.chicken);write(0x70028+d,p.arb);
+-        write(ctl,p.control);write(surf,p.surface);
+-        const bool running=waitFrames(io.read(frame));
+-        if(linkChanged){out.status=LinearStatus::StateChanged;return;}
+-        out.restored=stopped && running && io.read(ctl)==p.control && io.read(surf)==p.surface &&
+-            io.read(0x42084)==p.chicken && io.read(0x70028+d)==p.arb;
+-        if(!out.restored)out.status=LinearStatus::RollbackFailed;
+-    };
+-    write(ctl,p.control & ~0x80000000U);write(surf,p.surface);
+-    if(!waitFrames(io.read(frame)) || (io.read(ctl)&0x80000000U)) {
+-        out.status=LinearStatus::DisableTimeout;rollback();return out;
+-    }
+-    // Linux v6.12 intel_dpt_configure / Wa_22012358565 / plane_ctl_icl.
+-    write(0x42084,p.chicken | (1U<<30));
+-    write(0x70028+d,p.arb | (1U<<13));
+-    write(0x70188+d,p.stride);write(0x7018C+d,p.position);
+-    write(0x70190+d,p.size);write(0x701A4+d,p.offset);
+-    const auto control=(p.control & ~(7U<<28)) | (1U<<28);
+-    write(ctl,control);write(surf,p.surface);
+-    if(!waitFrames(io.read(frame)) || io.read(ctl)!=control || io.read(0x701AC+d)!=p.surface ||
+-        io.read(0x42084)!=(p.chicken|(1U<<30)) || io.read(0x70028+d)!=(p.arb|(1U<<13))) {
+-        out.status=LinearStatus::EnableTimeout;rollback();return out;
+-    }
+-    out.framesAfter=io.read(frame);out.status=LinearStatus::Success;
+-    return out;
+-}
+-
+-struct GGTTBlock {
+-    uint64_t first {}, last {}, zero {}, present {}, other {};
+-};
+-struct GGTTReadout {
+-    uint64_t version {1}, status {}, pages {}, zero {}, present {}, other {}, zeroStart {}, zeroPages {};
+-    GGTTBlock blocks[32] {}; // 8MiB aperture regions, not the whole PTE table.
+-};
+-static_assert(sizeof(GGTTReadout)==168*8,"AlderLakeN GGTT readout layout");
+-
+-// Diagnostic only: nonzero/scratch entries never authorize a reservation.
+-template<class IO> GGTTReadout readGGTT(IO &io, bool admitted) {
+-    GGTTReadout out;
+-    if(!admitted)return out;
+-    out.status=2;
+-    constexpr uint32_t pages=0x10000000/4096;
+-    if(!io.readable(0x800000+pages*8-1))return out;
+-    uint64_t run=0,start=0;
+-    for(uint32_t i=0;i<pages;++i) {
+-        const auto pte=io.readPTE(0x800000+8*i);
+-        if(pte==UINT64_MAX)return out;
+-        auto &block=out.blocks[i/2048];
+-        if(i%2048==0)block.first=pte;
+-        block.last=pte;++out.pages;
+-        if(!pte) {
+-            ++out.zero;++block.zero;
+-            if(!run)start=uint64_t(i)*4096;
+-            if(++run>out.zeroPages) {out.zeroStart=start;out.zeroPages=run;}
+-        } else {
+-            run=0;
+-            if(pte&1) {++out.present;++block.present;}
+-            else {++out.other;++block.other;}
+-        }
+-    }
+-    out.status=1;return out;
+-}
+-
+-constexpr uint32_t ScanoutBytes = 0x800000; // Rounded FHD XRGB8888 buffer.
+-constexpr uint32_t ScanoutSlot = 0x04000000; // Temporary firmware lease, away from GOP and GTT storage.
+-constexpr uint32_t ScanoutPages = 2 * ScanoutBytes / 4096;
+-struct GGTTLease {
+-    uint64_t version {1}, status {}, slot {ScanoutSlot}, bytes {2*ScanoutBytes};
+-    uint64_t stolenBase {}, verifiedPages {}, gopEnd {}, first {}, last {};
+-};
+-static_assert(sizeof(GGTTLease)==9*8,"AlderLakeN GGTT lease layout");
+-
+-// This exact pre-native-driver firmware lease is not a free-space allocator.
+-// Verify the physical stolen mapping in full, exclude the visible GOP
+-// allocation and GGC-reported GTT reserve, and save every leased
+-// PTE. Uninitialized aperture tail or generic scratch entries are not leased.
+-template<class IO> GGTTLease leaseGOPGGTT(IO &io, const DisplayReadout &r,
+-                                       uint64_t *predecessor, bool admitted,const XELPMemory::Layout &memory) {
+-    GGTTLease out;
+-    if(!admitted)return out;
+-    out.status=2;
+-    LinearPlan p;
+-    if(!predecessor || linearPlan(r,p)!=LinearStatus::Ready)return out;
+-    // Pattern diagnostics deliberately retain their FHD payload layout.
+-    if(p.geometry.width!=1920 || p.geometry.height!=1080 || p.geometry.pitch!=7680)return out;
+-    out.gopEnd=uint64_t(p.surface)+p.geometry.bytes;
+-    if(out.gopEnd>ScanoutSlot || !memory.range(ScanoutSlot,2*ScanoutBytes,true) ||
+-       !io.readable(0x800000+(memory.bytes/4096)*8-1))return out;
+-    const uint64_t base=memory.base;
+-    out.stolenBase=base;out.status=3;
+-    for(uint32_t i=0;i<memory.bytes/4096;++i) {
+-        const auto expected=(base+uint64_t(i)*4096)|1;
+-        if(io.readPTE(0x800000+8*i)!=expected)return out;
+-        ++out.verifiedPages;
+-        if(i>=ScanoutSlot/4096 && i<(ScanoutSlot+2*ScanoutBytes)/4096)
+-            predecessor[i-ScanoutSlot/4096]=expected;
+-    }
+-    out.first=predecessor[0];out.last=predecessor[ScanoutPages-1];out.status=1;
+-    return out;
+-}
+-enum class ScanoutStatus : uint64_t {
+-    NotAdmitted, BadMemory, BusyGGTT, InvalidDMA, StateChanged, PTEReadback,
+-    ApertureMismatch, FlipTimeout, RestoreFailed, Success, AllocationFailed
+-};
+-struct ScanoutResult {
+-    uint64_t version {1}, status {}, slot {ScanoutSlot}, bytes {ScanoutBytes}, pages {ScanoutPages};
+-    uint64_t pteWrites {}, pteErrors {}, apertureSamples {}, apertureErrors {}, flips {};
+-    uint64_t framesBefore {}, framesAfter {}, originalSurface {}, planeRestored {}, ptesRestored {}, retained {};
+-    uint64_t dmaFirst[2] {}, dmaLast[2] {}, pciCommand {}, descriptorOptions {}, holdMilliseconds {}, buffers {};
+-};
+-static_assert(sizeof(ScanoutResult)==24*8,"AlderLakeN scanout property layout");
+-
+-inline uint32_t patternPixel(unsigned buffer, uint32_t index) {
+-    if(index>=1920*1080)return 0xFF595959;
+-    const uint32_t x=index%1920,y=index/1920;
+-    const uint32_t bars[] {0xFFFFFF,0xFFFF00,0x00FFFF,0x00FF00,0xFF00FF,0xFF0000,0x0000FF,0};
+-    // Full-intensity primaries qualify geometry independently of inherited
+-    // GOP midtone CSC/gamma. Midtone color accuracy needs its own pipeline test.
+-    return 0xFF000000U | (buffer ? (((x/64)^(y/64))&1 ? 0x00FF00 : 0x0000FF) : bars[x/240]);
+-}
+-
+-// The caller pins DMA memory, checks PCI/aperture and serializes before other
+-// GPU drivers. A nonzero predecessor requires the exact firmware lease above;
+-// arbitrary valid/scratch PTEs never constitute free space. Restore the GOP
+-// surface before restoring the saved PTEs or removing a zero-PTE reservation.
+-template<class IO> ScanoutResult testScanout(IO &io, const DisplayReadout &r,
+-                                           const uint64_t *dma, bool admitted,
+-                                           const uint64_t *predecessor=nullptr) {
+-    ScanoutResult out;
+-    if(!admitted)return out;
+-    LinearPlan p;
+-    if(linearPlan(r,p)!=LinearStatus::Ready || !dma) {
+-        out.status=uint64_t(ScanoutStatus::BadMemory);return out;
+-    }
+-    const auto delta=0x1000*p.pipe;
+-    const uint32_t surf=0x7019C+delta,live=0x701AC+delta,frame=0x70040+delta;
+-    const uint32_t pteBase=0x800000+(ScanoutSlot>>9);
+-    out.originalSurface=p.surface;
+-    if(p.surface>=ScanoutSlot || !io.readable(pteBase+ScanoutPages*8-1)) {
+-        out.status=uint64_t(ScanoutStatus::BadMemory);return out;
+-    }
+-    for(uint32_t i=0;i<ScanoutPages;++i) {
+-        if(io.readPTE(pteBase+8*i)!=(predecessor ? predecessor[i] : 0)) {
+-            out.status=uint64_t(ScanoutStatus::BusyGGTT);return out;
+-        }
+-        if(!dma[i] || (dma[i]&4095) || dma[i]>0x7FFFFFF000ULL) {
+-            out.status=uint64_t(ScanoutStatus::InvalidDMA);return out;
+-        }
+-    }
+-    for(unsigned b=0;b<2;++b) {
+-        out.dmaFirst[b]=dma[b*ScanoutPages/2];out.dmaLast[b]=dma[(b+1)*ScanoutPages/2-1];
+-    }
+-    if(io.read(surf)!=p.surface || io.read(live)!=p.surface || io.read(0x70180+delta)!=p.control) {
+-        out.status=uint64_t(ScanoutStatus::StateChanged);return out;
+-    }
+-    const auto waitFrames=[&](uint32_t start) {
+-        for(unsigned n=0;n<1000;++n) {
+-            const auto now=io.read(frame);
+-            if(now==UINT32_MAX)return false;
+-            if(uint32_t(now-start)>=2 && uint32_t(now-start)<0x10000000)return true;
+-            io.delay();
+-        }
+-        return false;
+-    };
+-    out.framesBefore=io.read(frame);
+-    if(out.framesBefore==UINT32_MAX || !waitFrames(uint32_t(out.framesBefore))) {
+-        out.status=uint64_t(ScanoutStatus::FlipTimeout);return out;
+-    }
+-    // Gen12 integrated GGTT uses DMA address | PRESENT, not PPGTT flags.
+-    // UC 64-bit stores/readbacks (Linux gen8_ggtt_pte_encode/set_pte) suffice;
+-    // the Gen8 invalidate write is only for platforms with a WC GGTT mapping.
+-    for(uint32_t i=0;i<ScanoutPages;++i) {
+-        io.writePTE(pteBase+8*i,dma[i]|1);++out.pteWrites;
+-        if(io.readPTE(pteBase+8*i)!=(dma[i]|1))++out.pteErrors;
+-    }
+-    io.fence();
+-    bool planeTouched=false;
+-    out.status=uint64_t(ScanoutStatus::PTEReadback);
+-    if(!out.pteErrors) {
+-        out.status=uint64_t(ScanoutStatus::ApertureMismatch);
+-        // First/last dword of every owned page proves both mappings and CPU
+-        // visibility through the GPU aperture before any plane write.
+-        const uint32_t sampleOffsets[] {0,4092};
+-        for(uint32_t i=0;i<ScanoutPages;++i)for(auto off:sampleOffsets) {
+-            const auto byte=i*4096+off;
+-            const auto expected=patternPixel(byte/ScanoutBytes,(byte%ScanoutBytes)/4);
+-            ++out.apertureSamples;
+-            if(io.apertureRead(byte)!=expected)++out.apertureErrors;
+-        }
+-        if(!out.apertureErrors) {
+-            out.status=uint64_t(ScanoutStatus::FlipTimeout);
+-            const unsigned sequence[] {0,1,0};
+-            for(auto buffer:sequence) {
+-                const auto address=ScanoutSlot+buffer*ScanoutBytes;
+-                io.write(surf,address);io.read(surf);planeTouched=true;
+-                if(!waitFrames(io.read(frame)) || io.read(live)!=address)break;
+-                ++out.flips;io.hold(3000);out.holdMilliseconds+=3000;
+-            }
+-            if(out.flips==3)out.status=uint64_t(ScanoutStatus::Success);
+-        }
+-    }
+-    if(planeTouched) {
+-        io.write(surf,p.surface);io.read(surf);
+-        out.planeRestored=waitFrames(io.read(frame)) && io.read(live)==p.surface;
+-    } else out.planeRestored=1;
+-    // A failed restore keeps allocations and PTEs pinned until reboot.
+-    if(!out.planeRestored) {
+-        out.status=uint64_t(ScanoutStatus::RestoreFailed);out.retained=1;return out;
+-    }
+-    for(uint32_t i=0;i<ScanoutPages;++i) {
+-        io.writePTE(pteBase+8*i,predecessor ? predecessor[i] : 0);++out.pteWrites;
+-    }
+-    io.fence();out.ptesRestored=1;
+-    for(uint32_t i=0;i<ScanoutPages;++i)
+-        if(io.readPTE(pteBase+8*i)!=(predecessor ? predecessor[i] : 0))out.ptesRestored=0;
+-    if(!out.ptesRestored) {out.status=uint64_t(ScanoutStatus::RestoreFailed);out.retained=1;}
+-    out.framesAfter=io.read(frame);
+-    return out;
+-}
+-}
+-#endif
++// ADL-N/Twin Lake identity and fuse-derived small GT profile.
++// Runtime qualification remains separate from PCI family recognition.
++// Linux v6.12 intel_display_power_map.c / i915_reg.h provide Display 13
++// register definitions. TGL donor startup remains blocked until separately
++// qualified; recognizing this profile does not make the donor safe to start.
++#ifndef kern_alderlake_n_hpp
++#define kern_alderlake_n_hpp
++#include <stdint.h>
++#include "kern_xelp_platform.hpp"
++#include "kern_xelp_gt_resources.hpp"
++#include "kern_xelp_memory_layout.hpp"
++#include "kern_xelp_geometry.hpp"
++#include <stddef.h>
++#include "kern_display13_power_bridge.hpp"
++#include "kern_display13_clock.hpp"
++#include "kern_display13_tc.hpp"
++
++namespace AlderLakeN {
++constexpr uint32_t Identity = 0x46D18086;
++constexpr uint32_t DisplayVersion = 13;
++constexpr uint32_t GraphicsStep = 0; // A0, separate stepping domain.
++constexpr uint32_t DisplayStep = 3;  // D0 in the ADL-N revision table.
++
++// Linux v6.12 INTEL_ADLN_IDS includes Twin Lake 46D3/46D4. Do not infer
++// EU count from these IDs, and do not admit other ADL-P devices here.
++inline bool family(uint32_t identity) {
++    return XELP::identify(identity,0).family==XELP::Family::AlderLakeN;
++}
++inline bool matches(uint32_t identity, uint8_t revision) {
++    // Revision identifies the hardware; untested revisions use the family backend.
++    const auto p=XELP::identify(identity,revision);
++    return p.family==XELP::Family::AlderLakeN && p.admitted();
++}
++
++using Resources=XELP::SmallGTResources;
++using XELP::smallGTResources;
++inline bool resources(uint32_t slice,uint32_t dss,uint32_t euDisable,uint32_t l3Disable,Resources &out) {
++    return smallGTResources(slice,dss,euDisable,l3Disable,out);
++}
++
++struct Register { uint32_t offset {}, value {}; };
++enum class GTStatus : uint32_t {
++    NotAdmitted, ExistingOwner, AckTimeout, Unavailable, ProfileMismatch, ReleaseFailed, Complete
++};
++struct GTReadout {
++    uint32_t version {1};
++    GTStatus status {GTStatus::NotAdmitted};
++    uint32_t writes {}, requestedMask {}, releasedMask {}, releaseFailedMask {};
++    uint32_t requestBefore[2] {}, ackBefore[2] {}, ackHeld[2] {}, requestAfter[2] {}, ackAfter[2] {};
++    uint32_t fuses[5] {};
++    Resources resources;
++    uint32_t count {};
++    Register registers[16] {};
++};
++static_assert(sizeof(GTReadout)==60*4,"AlderLakeN GT readout layout");
++
++// Linux v6.12 gen12 forcewake domains: fuses and BCS are GT, RCS is render.
++// Only acquire an unowned kernel bit0. Never reset domains or alter engines.
++template<class IO> GTReadout readGT(IO &io, bool admitted, uint32_t *edram=nullptr,
++    bool (*decode)(const uint32_t *,Resources &)=nullptr) {
++    GTReadout out;
++    if(!admitted)return out;
++    constexpr uint32_t request[] {0xA188,0xA278},ack[] {0x130044,0xD84};
++    constexpr uint32_t fuse[] {0x9138,0x913C,0x9134,0x9118,0x9140};
++    constexpr uint32_t engine[] {0x2030,0x2034,0x2038,0x203C,0x209C,0x2234,0x2238,0x229C,
++        0x22030,0x22034,0x22038,0x2203C,0x2209C,0x22234,0x22238,0x2229C};
++    out.status=GTStatus::Unavailable;
++    for(unsigned d=0;d<2;++d)if(!io.readable(request[d]) || !io.readable(ack[d]))return out;
++    for(auto reg:fuse)if(!io.readable(reg))return out;
++    for(auto reg:engine)if(!io.readable(reg))return out;
++    for(unsigned d=0;d<2;++d) {
++        out.requestBefore[d]=io.read(request[d]);out.ackBefore[d]=io.read(ack[d]);
++        if(out.requestBefore[d]==UINT32_MAX || out.ackBefore[d]==UINT32_MAX)return out;
++        if((out.requestBefore[d]|out.ackBefore[d])&1) {out.status=GTStatus::ExistingOwner;return out;}
++    }
++    const auto wait=[&](unsigned d,bool held,uint32_t &last) {
++        for(unsigned n=0;n<500;++n) {
++            last=io.read(ack[d]);
++            if(last==UINT32_MAX)return false;
++            if(bool(last&1)==held)return true;
++            io.delay(); // 100us, bounded to Linux's 50ms ACK timeout.
++        }
++        return false;
++    };
++    for(unsigned d=0;d<2;++d) {
++        io.write(request[d],0x00010001);++out.writes;out.requestedMask|=1U<<d;
++        io.read(request[d]);
++    }
++    out.status=GTStatus::AckTimeout;
++    bool held=true;
++    for(unsigned d=0;d<2;++d)if(!wait(d,true,out.ackHeld[d]))held=false;
++    if(out.ackHeld[0]==UINT32_MAX || out.ackHeld[1]==UINT32_MAX)out.status=GTStatus::Unavailable;
++    if(held) {
++        out.status=GTStatus::Complete;
++        for(unsigned i=0;i<5;++i) {
++            out.fuses[i]=io.read(fuse[i]);
++            if(out.fuses[i]==UINT32_MAX)out.status=GTStatus::Unavailable;
++        }
++        if(out.status==GTStatus::Complete &&
++           !(decode ? decode(out.fuses,out.resources) :
++             (resources(out.fuses[0],out.fuses[1],out.fuses[2],out.fuses[3],out.resources) &&
++              out.fuses[4]==0x000E00FE)))out.status=GTStatus::ProfileMismatch;
++        if(edram) {
++            *edram=io.readable(0x120010) ? io.read(0x120010) : UINT32_MAX;
++            if(*edram==UINT32_MAX)out.status=GTStatus::Unavailable;
++        }
++        for(auto reg:engine) {
++            const auto value=io.read(reg);out.registers[out.count++]={reg,value};
++            if(value==UINT32_MAX)out.status=GTStatus::Unavailable;
++        }
++    }
++    for(int d=1;d>=0;--d) {
++        io.write(request[d],0x00010000);++out.writes;
++        out.requestAfter[d]=io.read(request[d]);
++        // Upper16 are the masked-write enable field, not client ownership.
++        if(wait(unsigned(d),false,out.ackAfter[d]) &&
++           (out.requestAfter[d]&0xFFFF)==(out.requestBefore[d]&0xFFFF))
++            out.releasedMask|=1U<<d;
++        else out.releaseFailedMask|=1U<<d;
++    }
++    if(out.releaseFailedMask)out.status=GTStatus::ReleaseFailed;
++    return out;
++}
++enum class ReadoutStatus : uint32_t { NotAdmitted, Complete, Unavailable, PowerChanged };
++struct DisplayReadout {
++    uint32_t version {2};
++    ReadoutStatus status {ReadoutStatus::NotAdmitted};
++    uint32_t count {}, poweredPipes {}, activePipes {}, hdmiBPipes {};
++    Register registers[160] {};
++};
++
++// Read only. Check Display 13 PW_A/B/C before pipe-local registers; do not
++// access TGL FIA/TC/Dekel addresses or issue selector/power/MMIO writes.
++template<class IO> void readDisplay(IO &io, bool admitted, DisplayReadout &r) {
++    // Reused storage must not retain pipe bits or registers from an earlier
++    // snapshot. Reset fields in place: aggregate assignment can itself reserve
++    // a full DisplayReadout temporary on the unoptimized kernel stack.
++    r.version=2;r.status=ReadoutStatus::NotAdmitted;
++    r.count=r.poweredPipes=r.activePipes=r.hdmiBPipes=0;
++    for(auto &reg:r.registers) {reg.offset=0;reg.value=0;}
++    if (!admitted) return;
++    const auto add = [&](uint32_t offset) {
++        if (r.count >= sizeof(r.registers) / sizeof(r.registers[0]) || !io.readable(offset)) {
++            r.status = ReadoutStatus::Unavailable;
++            return UINT32_MAX;
++        }
++        const uint32_t value = io.read(offset);
++        r.registers[r.count++] = {offset, value};
++        if (value == UINT32_MAX) r.status = ReadoutStatus::Unavailable;
++        return value;
++    };
++    r.status = ReadoutStatus::Complete;
++    const uint32_t power = add(0x45404);
++    if (r.status != ReadoutStatus::Complete) return;
++    // Always-on / PW1 display state, including BIOS and DDI I/O ownership.
++    const uint32_t common[] {0x45400, 0x45408, 0x4540C, 0x45450, 0x45454, 0x4545C,
++        0x45420, 0x45424, 0x45444, 0x42000, 0x42084,
++        0x44300, 0x4438C, 0x45008, 0x4500C, 0x45010, 0x45014,
++        0x46000, 0x46004, 0x164280, 0x164284, 0x164288, 0x16428C,
++        0x64000, 0x64100, 0x64200};
++    for (auto offset : common) add(offset);
++    for (unsigned pipe = 0; pipe < 3; ++pipe) {
++        // XELPD_PW_CTL_IDX_PW_A = 5, B = 6, C = 7; state bit = 2*idx.
++        if (!(power & (1U << (2 * (5 + pipe))))) continue;
++        r.poweredPipes |= 1U << pipe;
++        const auto func = add(0x60400 + 0x1000 * pipe);
++        if (func != UINT32_MAX && (func & 0x80000000)) {
++            r.activePipes |= 1U << pipe;
++            // TGL+ uses (port + 1) in bits30:27. B is encoded as 2.
++            if (((func >> 27) & 15) == 2 && ((func >> 24) & 7) <= 1)
++                r.hdmiBPipes |= 1U << pipe;
++        }
++        const uint32_t local[] {0x60000, 0x60004, 0x60008, 0x6000C, 0x60010,
++            0x60014, 0x6001C, 0x70008, 0x70028, 0x70040, 0x70080, 0x70084,
++            0x70180, 0x70188, 0x7018C, 0x70190, 0x7019C, 0x701A4, 0x701AC,
++            0x7027C, 0x7037C, 0x70280, 0x70380, 0x70480, 0x70580, 0x70680, 0x70780};
++        for (auto offset : local) add(offset + 0x1000 * pipe);
++        // TGL+ DP transport is transcoder-indexed, not DDI-indexed. M2/N2
++        // are absent on Display13 (Linux intel_cpu_transcoder_has_m2_n2).
++        const uint32_t transport[] {0x60404,0x60540,0x60030,0x60034,0x60040,0x60044};
++        for (auto offset : transport)
++            add(offset + 0x1000 * pipe);
++        add(0x46140 + 4 * pipe);
++        // Display11+ has two scalers per powered pipe (Linux display runtime).
++        // Capture the binding and destination, without touching power/coefficients.
++        for(unsigned scaler=0;scaler<2;++scaler) {
++            const auto base=0x68170+0x800*pipe+0x100*scaler;
++            add(base);add(base+4);add(base+0x10);
++        }
++        // Display13 DSC/joiner belongs to the corresponding pipe well.
++        add(0x78000 + 0x200 * pipe);add(0x78004 + 0x200 * pipe);
++    }
++    const auto after = add(0x45404);
++    if (r.status == ReadoutStatus::Complete && after != power)
++        r.status = ReadoutStatus::PowerChanged;
++}
++// Value-returning callers retain the existing API. Early bootstrap uses the
++// in-place overload with one allocated snapshot instead of stacked copies.
++template<class IO> DisplayReadout readDisplay(IO &io, bool admitted) {
++    DisplayReadout r;
++    readDisplay(io,admitted,r);
++    return r;
++}
++
++inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
++    if (r.count > sizeof(r.registers) / sizeof(r.registers[0])) return false;
++    for (uint32_t i=0; i<r.count; ++i)
++        if (r.registers[i].offset==offset) { out=r.registers[i].value; return out!=UINT32_MAX; }
++    return false;
++}
++
++// Source-side certificate for an already-running, uncompressed external SST
++// GOP. This does not prove sink DPCD state, PLL rate or native AUX ownership.
++inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const Display13TC::Boot *tc=nullptr,bool panel=false) {
++    const bool typeC=ddi>=3 && ddi<=6;
++    if((panel && ddi>=2) || pipe>=3 || (ddi>=2 && !typeC) || boot.status!=ReadoutStatus::Complete ||
++       !(boot.activePipes&boot.poweredPipes&(1U<<pipe)))return false;
++    const auto bank=pipe*0x1000;
++    uint32_t trans=0,tp=0,buf=0,clock=0,ctl2=0,dss1=0,dss2=0,dm=0,dn=0,lm=0,ln=0;
++    // TC buffer access needs the separate powered TCSS/ownership witness.
++    // Do not add every TC register to the unconditional common readout.
++    if(typeC) {
++        uint32_t power=0,ddiPower=0;
++        if(!tc || !tc->valid() || tc->port.ddi!=ddi || tc->pipe!=pipe ||
++           !value(boot,0x45404,power) || power!=tc->power ||
++           !value(boot,0x45454,ddiPower) || ddiPower!=tc->ddiPower)return false;
++        buf=tc->buffer;
++    } else if(!value(boot,0x64000+ddi*0x100,buf))return false;
++    if(!value(boot,0x60400+bank,trans) || !value(boot,0x60540+bank,tp) ||
++       !value(boot,0x46140+4*pipe,clock) ||
++       !value(boot,0x60404+bank,ctl2) || !value(boot,0x78000+pipe*0x200,dss1) ||
++       !value(boot,0x78004+pipe*0x200,dss2) || !value(boot,0x60030+bank,dm) ||
++       !value(boot,0x60034+bank,dn) || !value(boot,0x60040+bank,lm) ||
++       !value(boot,0x60044+bank,ln))return false;
++    const unsigned lanes=((trans>>1)&7)+1;
++    // Linux v6.12 i915_reg.h: SST, normal training, scrambling, no FEC/MST,
++    // port sync, HDCP, DSC or joined pipes. Enhanced framing may be on or off.
++    // intel_ddi_read_func_ctl classifies SST from MODE_SELECT, not the MST
++    // payload-allocation bit. Firmware may leave bit8 set on an SST GOP;
++    // preserve it and include it in the unchanged-source check, never clear it
++    // on an enabled transcoder or infer an MST transport from that bit alone.
++    return (trans&0xFF700000U)==(0x82000000U|((ddi+1)<<27)) &&
++        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
++        (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
++        (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
++            (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&
++        (clock>>28)==ddi+(typeC?3:1) && (!typeC || clock==tc->transClock) &&
++        (tp&~((1U<<18)|(panel?1U<<6:0)))==0x80000300U &&
++        !(dss1&0xF0300000U) && !(dss2&0x80008000U) &&
++        !(dm&0x81000000U) && (dm&0xFFFFFF) &&
++        dn && !(dn&0xFF000000U) && lm && !(lm&0xFF000000U) && ln && !(ln&0xFF000000U) &&
++        (dm&0xFFFFFF)<=dn;
++}
++enum class GOPProtocol : uint32_t {TMDS,DP,EDP};
++// Source and power must remain unchanged while only the plane is reinitialized.
++// This is an early, serialized bootstrap transaction, not a modeset or link
++// adoption certificate. A changed link stops further writes, including rollback.
++template<class IO> bool dpSourceUnchanged(IO &io,const DisplayReadout &r,unsigned pipe,unsigned ddi,
++                                         uint32_t addedAUXRequest=0,const Display13TC::Boot *tc=nullptr,bool panel=false) {
++    // addedAUXRequest is the existing Combo boot-lease transition only.
++    // TC lifetime uses Mode's own AUX lease, not the Combo MainLinkAUX slot.
++    if(!dpSource(r,pipe,ddi,tc,panel) || (addedAUXRequest && (ddi>=2 || addedAUXRequest!=(2U<<(2*ddi)))))return false;
++    if(ddi>=3 && !tc->unchanged(io))return false;
++    const uint32_t bank=pipe*0x1000;
++    // Recheck power before touching pipe-local registers. A captured snapshot
++    // is not permission to read a bank whose well has since disappeared.
++    const uint32_t regs[] {0x45404,0x45454,0x45444,0x42000,
++        0x60400+bank,0x60404+bank,0x60540+bank,0x60030+bank,0x60034+bank,
++        0x60040+bank,0x60044+bank,0x70008+bank,0x46140+4*pipe,0x64000+0x100*ddi,
++        0x78000+0x200*pipe,0x78004+0x200*pipe};
++    for(auto reg:regs) {
++        uint32_t expected=0;
++        if(ddi>=3 && reg==0x64000+0x100*ddi)expected=tc->buffer;
++        else if(!value(r,reg,expected))return false;
++        if(!io.readable(reg))return false;
++        if(reg==Display13Power::AUX)expected|=addedAUXRequest;
++        if(io.read(reg)!=expected)return false;
++    }
++    return true;
++}
++// The GOP is already driving DP. Keep its physical AUX domain on without
++// inventing a native transaction reference or claiming the firmware request.
++// Caller holds the display owner lock throughout both proof and acquisition.
++template<class IO> Display13Power::Result holdDPBootAUX(IO &io,const DisplayReadout &boot,
++    Display13Power::NativeBridge &bridge,Display13Power::MainLinkAUX &link,unsigned ddi,bool panel=false) {
++    using namespace Display13Power;Result r;
++    if(ddi>=2 || boot.activePipes!=1 || !dpSource(boot,0,ddi,nullptr,panel) || !dpSourceUnchanged(io,boot,0,ddi,0,nullptr,panel) ||
++       bridge.bootPort!=ddi || bridge.bootAdopted || !bridge.bootPGProtected || !bridge.bootDDIProtected ||
++       !bridge.outputHeld(io,ddi,0) || link.owner || link.bootPending || link.lease.owner)return r;
++    uint32_t aux=0;
++    if(!value(boot,AUX,aux) || !(aux&(1U<<(2*ddi))))return r; // No active-link cold power-up.
++    r=acquire(io,bridge.state,link.lease,auxDomain(ddi));
++    if(r.status!=Status::Complete)return r;
++    link.port=ddi;link.bootPending=true;
++    if(!dpSourceUnchanged(io,boot,0,ddi,2U<<(2*ddi),nullptr,panel) || !held(io,bridge.state,link.lease.domains)) {
++        // Do not release a newly acquired request under a still-active GOP.
++        bridge.state.faulted=true;r.status=Status::RequestLost;
++    }
++    return r;
++}
++// Bind the protected lease to the actual, independently validated native port.
++// The caller retains that object on success and then adopts the boot path.
++// No hardware request or native AUX transaction counter changes at handoff.
++// Diagnostic: last adoptDPBootAUX rejection mask (bit per failed condition).
++inline uint32_t adoptDPBootAUXMask {};
++template<class IO> Display13Power::Result adoptDPBootAUX(IO &io,const DisplayReadout &boot,
++    Display13Power::NativeBridge &bridge,Display13Power::MainLinkAUX &link,uintptr_t target,unsigned ddi,bool panel=false) {
++    using namespace Display13Power;Result r;
++    uint32_t m=0;
++    if(!target)m|=1U;
++    if(ddi>=2){adoptDPBootAUXMask=2U;return r;}
++    if(boot.activePipes!=1)m|=4U;
++    if(!dpSource(boot,0,ddi,nullptr,panel))m|=8U;
++    if(!dpSourceUnchanged(io,boot,0,ddi,0,nullptr,panel))m|=0x10U;
++    if(bridge.bootPort!=ddi)m|=0x20U;
++    if(bridge.bootAdopted)m|=0x40U;
++    if(!bridge.bootPGProtected)m|=0x80U;
++    if(!bridge.bootDDIProtected)m|=0x100U;
++    if(!bridge.outputHeld(io,ddi,0))m|=0x200U;
++    if(!link.bootPending)m|=0x400U;
++    if(link.owner)m|=0x800U;
++    if(link.port!=ddi)m|=0x1000U;
++    if(link.lease.owner!=&bridge.state)m|=0x2000U;
++    if(link.lease.domains!=dependencies(auxDomain(ddi)))m|=0x4000U;
++    if(!held(io,bridge.state,link.lease.domains))m|=0x8000U;
++    adoptDPBootAUXMask=m;
++    if(m)return r;
++    link.owner=target;link.bootPending=false;r.status=Status::Complete;return r;
++}
++enum class LinearStatus : uint32_t {
++    NotAdmitted, Ready, Success, NotSingleHDMI, NotLinearFHD, OtherPlaneActive,
++    StateChanged, NoVblank, DisableTimeout, EnableTimeout, RollbackFailed, InvalidDPSource, InvalidTCSource
++};
++struct LinearPlan {
++    uint32_t pipe {}, chicken {}, arb {}, control {}, stride {}, position {}, size {}, offset {}, surface {};
++    XELPGeometry::Linear geometry;
++};
++struct LinearResult {
++    uint32_t version {1};
++    LinearStatus status {LinearStatus::NotAdmitted};
++    uint32_t pipe {}, writes {}, framesBefore {}, framesAfter {}, restored {};
++};
++
++// Qualify a firmware pipe scaler separately from an unscaled linear GOP.
++// PIPESRC is width:height minus one; scaler WIN_SZ is width:height, not
++// minus one. Only one pipe-bound scaler covering the complete output is
++// accepted. Plane-bound/planar/programmed-factor scaling is not this contract.
++inline bool bootGeometry(const DisplayReadout &r,unsigned pipe,const XELPGeometry::Linear &geometry,
++                         uint32_t ht,uint32_t vt) {
++    if(XELPGeometry::timing(geometry,ht,vt))return true;
++    if(!geometry.valid || pipe>=3 || ht==UINT32_MAX || vt==UINT32_MAX ||
++       (ht&0xC000C000) || (vt&0xC000C000))return false;
++    uint32_t src=0;
++    if(!value(r,0x6001C+0x1000*pipe,src) ||
++       src!=(((geometry.width-1)<<16)|(geometry.height-1)))return false;
++    const auto width=(ht&0x3FFF)+1,height=(vt&0x3FFF)+1;
++    if(((ht>>16)&0x3FFF)+1<width || ((vt>>16)&0x3FFF)+1<height ||
++       width<geometry.width || height<geometry.height)return false;
++    unsigned active=0;
++    for(unsigned scaler=0;scaler<2;++scaler) {
++        const auto base=0x68170+0x800*pipe+0x100*scaler;
++        uint32_t ctl=0,pos=0,size=0;
++        if(!value(r,base+0x10,ctl) || !value(r,base,pos) || !value(r,base+4,size))return false;
++        if(!(ctl&0x80000000U))continue;
++        if((ctl&((7U<<25)|(1U<<29)|(1U<<19))) || pos || size!=((width<<16)|height))return false;
++        ++active;
++    }
++    return active==1;
++}
++template<class IO> bool bootGeometryUnchanged(IO &io,const DisplayReadout &r,unsigned pipe) {
++    // The accepted scaler stays live while the primary plane changes GGTT mode.
++    // Any captured source/timing/scaler drift invalidates the handoff.
++    const uint32_t regs[] {0x60000+0x1000*pipe,0x6000C+0x1000*pipe,0x6001C+0x1000*pipe,
++        0x68170+0x800*pipe,0x68174+0x800*pipe,0x68180+0x800*pipe,
++        0x68270+0x800*pipe,0x68274+0x800*pipe,0x68280+0x800*pipe};
++    for(auto reg:regs) {uint32_t v=0;if(value(r,reg,v) && io.read(reg)!=v)return false;}
++    return true;
++}
++
++// First Display 13 operation: reinitialize an existing linear RGB primary
++// plane on the explicitly selected Combo, or fixed TC with a live link
++// certificate. The default remains B for
++// the original standalone diagnostics. No new PLL/PHY/power-well cold
++// initialization, a new GGTT mapping, full modeset or accelerated scanout.
++inline LinearStatus linearPlan(const DisplayReadout &r, LinearPlan &p,unsigned ddi=1,GOPProtocol protocol=GOPProtocol::TMDS,
++                               const Display13TC::Boot *tc=nullptr) {
++    p={};
++    if (ddi>=7 || r.status!=ReadoutStatus::Complete || !r.activePipes || (r.activePipes&~7U) ||
++        (r.activePipes & (r.activePipes-1)) || (r.activePipes&~r.poweredPipes) ||
++        (protocol!=GOPProtocol::TMDS && protocol!=GOPProtocol::DP && protocol!=GOPProtocol::EDP) ||
++        (protocol==GOPProtocol::TMDS && ddi==1 && r.activePipes!=r.hdmiBPipes))
++        return LinearStatus::NotSingleHDMI;
++    while (!(r.activePipes & (1U<<p.pipe))) ++p.pipe;
++    if (p.pipe>=3) return LinearStatus::NotSingleHDMI;
++    if(ddi>=3 && (!tc || !tc->valid() || tc->port.ddi!=ddi || tc->pipe!=p.pipe ||
++       (protocol!=GOPProtocol::DP && tc->ownershipOptional)))
++        return LinearStatus::InvalidTCSource;
++    const uint32_t delta=0x1000*p.pipe;
++    uint32_t trans {}, cursor {}, surfLive {}, plane {}, pipeConf {}, htotal {}, vtotal {};
++    if (!value(r,0x42084,p.chicken) || !value(r,0x70028+delta,p.arb) ||
++        !value(r,0x70180+delta,p.control) || !value(r,0x70188+delta,p.stride) ||
++        !value(r,0x7018C+delta,p.position) || !value(r,0x70190+delta,p.size) ||
++        !value(r,0x701A4+delta,p.offset) || !value(r,0x7019C+delta,p.surface) ||
++        !value(r,0x701AC+delta,surfLive) || !value(r,0x60400+delta,trans) ||
++        !value(r,0x70008+delta,pipeConf) || !value(r,0x60000+delta,htotal) || !value(r,0x6000C+delta,vtotal))
++        return LinearStatus::NotLinearFHD;
++    if(!(trans&(1U<<31)) || ((trans>>27)&15)!=ddi+1 ||
++       (protocol==GOPProtocol::TMDS && ((trans>>24)&7)>1))
++        return LinearStatus::NotSingleHDMI;
++    if(protocol!=GOPProtocol::TMDS && !dpSource(r,p.pipe,ddi,tc,protocol==GOPProtocol::EDP))return LinearStatus::InvalidDPSource;
++    p.geometry=XELPGeometry::linear(p.control,p.stride,p.size,p.position,p.offset);
++    if(!p.geometry.valid || (p.surface&4095) || p.surface!=surfLive ||
++       ((trans>>20)&7)!=0 || (pipeConf&0xC0000000)!=0xC0000000 ||
++       !bootGeometry(r,p.pipe,p.geometry,htotal,vtotal))return LinearStatus::NotLinearFHD;
++    // DPT disable is global on Display 13. Exclude all other active planes
++    // and cursors, including planes on powered but inactive pipes.
++    for (unsigned pipe=0;pipe<3;++pipe) {
++        if (!(r.poweredPipes & (1U<<pipe))) continue;
++        const auto d=0x1000*pipe;
++        if (!value(r,0x70080+d,cursor) || (cursor & 0x3f))
++            return LinearStatus::OtherPlaneActive;
++        if (pipe!=p.pipe && (!value(r,0x70180+d,plane) || (plane & 0x80000000)))
++            return LinearStatus::OtherPlaneActive;
++        for (unsigned n=2;n<=7;++n)
++            if (!value(r,0x70080+0x100*n+d,plane) || (plane & 0x80000000))
++                return LinearStatus::OtherPlaneActive;
++    }
++    return LinearStatus::Ready;
++}
++
++template<class IO> LinearResult reinitializeLinear(IO &io, const DisplayReadout &r, bool admitted,unsigned ddi=1,
++                                                  GOPProtocol protocol=GOPProtocol::TMDS,const Display13TC::Boot *tc=nullptr) {
++    LinearResult out;
++    if (!admitted) return out;
++    LinearPlan p;
++    out.status=linearPlan(r,p,ddi,protocol,tc);
++    if(out.status!=LinearStatus::Ready)return out;
++    out.pipe=p.pipe;
++    const auto d=0x1000*p.pipe;
++    const uint32_t ctl=0x70180+d, surf=0x7019C+d, frame=0x70040+d;
++    const auto write=[&](uint32_t reg,uint32_t v){io.write(reg,v);++out.writes;io.read(reg);};
++    bool linkChanged=false;
++    const auto linkStable=[&] {
++        if(!bootGeometryUnchanged(io,r,p.pipe))linkChanged=true;
++        if(protocol!=GOPProtocol::TMDS && !dpSourceUnchanged(io,r,p.pipe,ddi,0,tc,protocol==GOPProtocol::EDP))linkChanged=true;
++        if(ddi>=3 && (!tc || !tc->unchanged(io)))linkChanged=true;
++        return !linkChanged;
++    };
++    // Check all captured words used by the transaction before the first write.
++    uint32_t trans=0;value(r,0x60400+d,trans);
++    const Register expected[] {{0x60400+d,trans},{0x42084,p.chicken},{0x70028+d,p.arb},{ctl,p.control},
++        {0x70188+d,p.stride},{0x7018C+d,p.position},{0x70190+d,p.size},
++        {0x701A4+d,p.offset},{surf,p.surface}};
++    for(auto pair:expected)if(io.read(pair.offset)!=pair.value){out.status=LinearStatus::StateChanged;return out;}
++    if(!linkStable()){out.status=LinearStatus::StateChanged;return out;}
++    const auto waitFrames=[&](uint32_t start) {
++        for(unsigned i=0;i<1000;++i) {
++            if(!linkStable())return false;
++            const auto now=io.read(frame);
++            if(now==UINT32_MAX)return false;
++            if(uint32_t(now-start)>=2 && uint32_t(now-start)<0x10000000)return true;
++            io.delay(); // 100us; at most100ms at the qualified FHD60 timing.
++        }
++        return false;
++    };
++    out.framesBefore=io.read(frame);
++    if(out.framesBefore==UINT32_MAX || !waitFrames(out.framesBefore)) {
++        out.status=linkChanged ? LinearStatus::StateChanged : LinearStatus::NoVblank;return out;
++    }
++    const auto rollback=[&] {
++        if(!linkStable()){out.status=LinearStatus::StateChanged;return;}
++        write(ctl,p.control & ~0x80000000U);write(surf,p.surface);
++        const bool stopped=waitFrames(io.read(frame));
++        if(linkChanged){out.status=LinearStatus::StateChanged;return;}
++        write(0x42084,p.chicken);write(0x70028+d,p.arb);
++        write(ctl,p.control);write(surf,p.surface);
++        const bool running=waitFrames(io.read(frame));
++        if(linkChanged){out.status=LinearStatus::StateChanged;return;}
++        out.restored=stopped && running && io.read(ctl)==p.control && io.read(surf)==p.surface &&
++            io.read(0x42084)==p.chicken && io.read(0x70028+d)==p.arb;
++        if(!out.restored)out.status=LinearStatus::RollbackFailed;
++    };
++    write(ctl,p.control & ~0x80000000U);write(surf,p.surface);
++    if(!waitFrames(io.read(frame)) || (io.read(ctl)&0x80000000U)) {
++        out.status=LinearStatus::DisableTimeout;rollback();return out;
++    }
++    // Linux v6.12 intel_dpt_configure / Wa_22012358565 / plane_ctl_icl.
++    write(0x42084,p.chicken | (1U<<30));
++    write(0x70028+d,p.arb | (1U<<13));
++    write(0x70188+d,p.stride);write(0x7018C+d,p.position);
++    write(0x70190+d,p.size);write(0x701A4+d,p.offset);
++    const auto control=(p.control & ~(7U<<28)) | (1U<<28);
++    write(ctl,control);write(surf,p.surface);
++    if(!waitFrames(io.read(frame)) || io.read(ctl)!=control || io.read(0x701AC+d)!=p.surface ||
++        io.read(0x42084)!=(p.chicken|(1U<<30)) || io.read(0x70028+d)!=(p.arb|(1U<<13))) {
++        out.status=LinearStatus::EnableTimeout;rollback();return out;
++    }
++    out.framesAfter=io.read(frame);out.status=LinearStatus::Success;
++    return out;
++}
++
++struct GGTTBlock {
++    uint64_t first {}, last {}, zero {}, present {}, other {};
++};
++struct GGTTReadout {
++    uint64_t version {1}, status {}, pages {}, zero {}, present {}, other {}, zeroStart {}, zeroPages {};
++    GGTTBlock blocks[32] {}; // 8MiB aperture regions, not the whole PTE table.
++};
++static_assert(sizeof(GGTTReadout)==168*8,"AlderLakeN GGTT readout layout");
++
++// Diagnostic only: nonzero/scratch entries never authorize a reservation.
++template<class IO> GGTTReadout readGGTT(IO &io, bool admitted) {
++    GGTTReadout out;
++    if(!admitted)return out;
++    out.status=2;
++    constexpr uint32_t pages=0x10000000/4096;
++    if(!io.readable(0x800000+pages*8-1))return out;
++    uint64_t run=0,start=0;
++    for(uint32_t i=0;i<pages;++i) {
++        const auto pte=io.readPTE(0x800000+8*i);
++        if(pte==UINT64_MAX)return out;
++        auto &block=out.blocks[i/2048];
++        if(i%2048==0)block.first=pte;
++        block.last=pte;++out.pages;
++        if(!pte) {
++            ++out.zero;++block.zero;
++            if(!run)start=uint64_t(i)*4096;
++            if(++run>out.zeroPages) {out.zeroStart=start;out.zeroPages=run;}
++        } else {
++            run=0;
++            if(pte&1) {++out.present;++block.present;}
++            else {++out.other;++block.other;}
++        }
++    }
++    out.status=1;return out;
++}
++
++constexpr uint32_t ScanoutBytes = 0x800000; // Rounded FHD XRGB8888 buffer.
++constexpr uint32_t ScanoutSlot = 0x04000000; // Temporary firmware lease, away from GOP and GTT storage.
++constexpr uint32_t ScanoutPages = 2 * ScanoutBytes / 4096;
++struct GGTTLease {
++    uint64_t version {1}, status {}, slot {ScanoutSlot}, bytes {2*ScanoutBytes};
++    uint64_t stolenBase {}, verifiedPages {}, gopEnd {}, first {}, last {};
++};
++static_assert(sizeof(GGTTLease)==9*8,"AlderLakeN GGTT lease layout");
++
++// This exact pre-native-driver firmware lease is not a free-space allocator.
++// Verify the physical stolen mapping in full, exclude the visible GOP
++// allocation and GGC-reported GTT reserve, and save every leased
++// PTE. Uninitialized aperture tail or generic scratch entries are not leased.
++template<class IO> GGTTLease leaseGOPGGTT(IO &io, const DisplayReadout &r,
++                                       uint64_t *predecessor, bool admitted,const XELPMemory::Layout &memory) {
++    GGTTLease out;
++    if(!admitted)return out;
++    out.status=2;
++    LinearPlan p;
++    if(!predecessor || linearPlan(r,p)!=LinearStatus::Ready)return out;
++    // Pattern diagnostics deliberately retain their FHD payload layout.
++    if(p.geometry.width!=1920 || p.geometry.height!=1080 || p.geometry.pitch!=7680)return out;
++    out.gopEnd=uint64_t(p.surface)+p.geometry.bytes;
++    if(out.gopEnd>ScanoutSlot || !memory.range(ScanoutSlot,2*ScanoutBytes,true) ||
++       !io.readable(0x800000+(memory.bytes/4096)*8-1))return out;
++    const uint64_t base=memory.base;
++    out.stolenBase=base;out.status=3;
++    for(uint32_t i=0;i<memory.bytes/4096;++i) {
++        const auto expected=(base+uint64_t(i)*4096)|1;
++        if(io.readPTE(0x800000+8*i)!=expected)return out;
++        ++out.verifiedPages;
++        if(i>=ScanoutSlot/4096 && i<(ScanoutSlot+2*ScanoutBytes)/4096)
++            predecessor[i-ScanoutSlot/4096]=expected;
++    }
++    out.first=predecessor[0];out.last=predecessor[ScanoutPages-1];out.status=1;
++    return out;
++}
++enum class ScanoutStatus : uint64_t {
++    NotAdmitted, BadMemory, BusyGGTT, InvalidDMA, StateChanged, PTEReadback,
++    ApertureMismatch, FlipTimeout, RestoreFailed, Success, AllocationFailed
++};
++struct ScanoutResult {
++    uint64_t version {1}, status {}, slot {ScanoutSlot}, bytes {ScanoutBytes}, pages {ScanoutPages};
++    uint64_t pteWrites {}, pteErrors {}, apertureSamples {}, apertureErrors {}, flips {};
++    uint64_t framesBefore {}, framesAfter {}, originalSurface {}, planeRestored {}, ptesRestored {}, retained {};
++    uint64_t dmaFirst[2] {}, dmaLast[2] {}, pciCommand {}, descriptorOptions {}, holdMilliseconds {}, buffers {};
++};
++static_assert(sizeof(ScanoutResult)==24*8,"AlderLakeN scanout property layout");
++
++inline uint32_t patternPixel(unsigned buffer, uint32_t index) {
++    if(index>=1920*1080)return 0xFF595959;
++    const uint32_t x=index%1920,y=index/1920;
++    const uint32_t bars[] {0xFFFFFF,0xFFFF00,0x00FFFF,0x00FF00,0xFF00FF,0xFF0000,0x0000FF,0};
++    // Full-intensity primaries qualify geometry independently of inherited
++    // GOP midtone CSC/gamma. Midtone color accuracy needs its own pipeline test.
++    return 0xFF000000U | (buffer ? (((x/64)^(y/64))&1 ? 0x00FF00 : 0x0000FF) : bars[x/240]);
++}
++
++// The caller pins DMA memory, checks PCI/aperture and serializes before other
++// GPU drivers. A nonzero predecessor requires the exact firmware lease above;
++// arbitrary valid/scratch PTEs never constitute free space. Restore the GOP
++// surface before restoring the saved PTEs or removing a zero-PTE reservation.
++template<class IO> ScanoutResult testScanout(IO &io, const DisplayReadout &r,
++                                           const uint64_t *dma, bool admitted,
++                                           const uint64_t *predecessor=nullptr) {
++    ScanoutResult out;
++    if(!admitted)return out;
++    LinearPlan p;
++    if(linearPlan(r,p)!=LinearStatus::Ready || !dma) {
++        out.status=uint64_t(ScanoutStatus::BadMemory);return out;
++    }
++    const auto delta=0x1000*p.pipe;
++    const uint32_t surf=0x7019C+delta,live=0x701AC+delta,frame=0x70040+delta;
++    const uint32_t pteBase=0x800000+(ScanoutSlot>>9);
++    out.originalSurface=p.surface;
++    if(p.surface>=ScanoutSlot || !io.readable(pteBase+ScanoutPages*8-1)) {
++        out.status=uint64_t(ScanoutStatus::BadMemory);return out;
++    }
++    for(uint32_t i=0;i<ScanoutPages;++i) {
++        if(io.readPTE(pteBase+8*i)!=(predecessor ? predecessor[i] : 0)) {
++            out.status=uint64_t(ScanoutStatus::BusyGGTT);return out;
++        }
++        if(!dma[i] || (dma[i]&4095) || dma[i]>0x7FFFFFF000ULL) {
++            out.status=uint64_t(ScanoutStatus::InvalidDMA);return out;
++        }
++    }
++    for(unsigned b=0;b<2;++b) {
++        out.dmaFirst[b]=dma[b*ScanoutPages/2];out.dmaLast[b]=dma[(b+1)*ScanoutPages/2-1];
++    }
++    if(io.read(surf)!=p.surface || io.read(live)!=p.surface || io.read(0x70180+delta)!=p.control) {
++        out.status=uint64_t(ScanoutStatus::StateChanged);return out;
++    }
++    const auto waitFrames=[&](uint32_t start) {
++        for(unsigned n=0;n<1000;++n) {
++            const auto now=io.read(frame);
++            if(now==UINT32_MAX)return false;
++            if(uint32_t(now-start)>=2 && uint32_t(now-start)<0x10000000)return true;
++            io.delay();
++        }
++        return false;
++    };
++    out.framesBefore=io.read(frame);
++    if(out.framesBefore==UINT32_MAX || !waitFrames(uint32_t(out.framesBefore))) {
++        out.status=uint64_t(ScanoutStatus::FlipTimeout);return out;
++    }
++    // Gen12 integrated GGTT uses DMA address | PRESENT, not PPGTT flags.
++    // UC 64-bit stores/readbacks (Linux gen8_ggtt_pte_encode/set_pte) suffice;
++    // the Gen8 invalidate write is only for platforms with a WC GGTT mapping.
++    for(uint32_t i=0;i<ScanoutPages;++i) {
++        io.writePTE(pteBase+8*i,dma[i]|1);++out.pteWrites;
++        if(io.readPTE(pteBase+8*i)!=(dma[i]|1))++out.pteErrors;
++    }
++    io.fence();
++    bool planeTouched=false;
++    out.status=uint64_t(ScanoutStatus::PTEReadback);
++    if(!out.pteErrors) {
++        out.status=uint64_t(ScanoutStatus::ApertureMismatch);
++        // First/last dword of every owned page proves both mappings and CPU
++        // visibility through the GPU aperture before any plane write.
++        const uint32_t sampleOffsets[] {0,4092};
++        for(uint32_t i=0;i<ScanoutPages;++i)for(auto off:sampleOffsets) {
++            const auto byte=i*4096+off;
++            const auto expected=patternPixel(byte/ScanoutBytes,(byte%ScanoutBytes)/4);
++            ++out.apertureSamples;
++            if(io.apertureRead(byte)!=expected)++out.apertureErrors;
++        }
++        if(!out.apertureErrors) {
++            out.status=uint64_t(ScanoutStatus::FlipTimeout);
++            const unsigned sequence[] {0,1,0};
++            for(auto buffer:sequence) {
++                const auto address=ScanoutSlot+buffer*ScanoutBytes;
++                io.write(surf,address);io.read(surf);planeTouched=true;
++                if(!waitFrames(io.read(frame)) || io.read(live)!=address)break;
++                ++out.flips;io.hold(3000);out.holdMilliseconds+=3000;
++            }
++            if(out.flips==3)out.status=uint64_t(ScanoutStatus::Success);
++        }
++    }
++    if(planeTouched) {
++        io.write(surf,p.surface);io.read(surf);
++        out.planeRestored=waitFrames(io.read(frame)) && io.read(live)==p.surface;
++    } else out.planeRestored=1;
++    // A failed restore keeps allocations and PTEs pinned until reboot.
++    if(!out.planeRestored) {
++        out.status=uint64_t(ScanoutStatus::RestoreFailed);out.retained=1;return out;
++    }
++    for(uint32_t i=0;i<ScanoutPages;++i) {
++        io.writePTE(pteBase+8*i,predecessor ? predecessor[i] : 0);++out.pteWrites;
++    }
++    io.fence();out.ptesRestored=1;
++    for(uint32_t i=0;i<ScanoutPages;++i)
++        if(io.readPTE(pteBase+8*i)!=(predecessor ? predecessor[i] : 0))out.ptesRestored=0;
++    if(!out.ptesRestored) {out.status=uint64_t(ScanoutStatus::RestoreFailed);out.retained=1;}
++    out.framesAfter=io.read(frame);
++    return out;
++}
++}
++#endif
+diff --git a/WhateverXe/kern_display13_wm.hpp b/WhateverXe/kern_display13_wm.hpp
+index b4cc458..0c7929d 100644
+--- a/WhateverXe/kern_display13_wm.hpp
++++ b/WhateverXe/kern_display13_wm.hpp
+@@ -286,12 +286,15 @@ inline TriggerSurfaces triggerSurfaces(const TriggerPacket *packets,uint32_t cou
+ // These linear RGB/cursor WM and PIPE_WM_LINETIME equations do not consume
+ // CDCLK. An unchanged hardware-verified plan is valid at another clock when
+ // every consumer still fits its bandwidth. A clock request alone is no proof.
++// Display 13 pipes process two pixels per CDCLK (Linux intel_cdclk.c, ppc=2 for
++// Display >= 10): the pixel budget is 2*CDCLK, which is exactly the donor's
++// nativeHz. A 3200x2000@120 eDP (809.5 MHz) exceeds CDCLK (652.8 MHz) yet fits.
+ inline bool clockFits(const Snapshot &s,uint64_t nativeHz) {
+     return s.primary && s.primary->status==Status::Complete && nativeHz &&
+-        s.primary->pixelHz && s.primary->pixelHz<=nativeHz/2 && s.pipePixelHz &&
+-        s.pipePixelHz<=nativeHz/2 && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
++        s.primary->pixelHz && s.primary->pixelHz<=nativeHz && s.pipePixelHz &&
++        s.pipePixelHz<=nativeHz && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
+         (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete &&
+-            s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz/2));
++            s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz));
+ }
+ enum class LatchCheck : uint32_t {None,Controls,OtherPlane,DSB,Clock,Registers,Live,Frame,AwaitingScanout,AwaitingFlip};
+ struct Latch {
+diff --git a/WhateverXe/kern_firmware.cpp b/WhateverXe/kern_firmware.cpp
+index 691e496..e84779e 100644
+--- a/WhateverXe/kern_firmware.cpp
++++ b/WhateverXe/kern_firmware.cpp
+@@ -1,79 +1,88 @@
+-#include "kern_xe.hpp"
+-#include "kern_dsi_math.hpp"
+-#include <IOKit/pci/IOPCIDevice.h>
+-#include <IOKit/IOMemoryDescriptor.h>
+-
+-static void publishBytes(IOPCIDevice *pci,const char *key,const void *bytes,unsigned length) {
+-    auto data=OSData::withBytes(bytes,length);
+-    if(data){pci->setProperty(key,data);data->release();}
+-}
+-
+-// Firmware is read once, before topology/hook selection. No PCI BAR/ROM scan,
+-// power acquisition, or MMIO probing occurs here. Explicit properties win later.
+-void XE::xelpReadFirmware(IOPCIDevice *pci) {
+-    // Wiring is needed by framebuffer-only profiles before Render is admitted.
+-    if(!pci || !xeProfile.displayAdmitted())return;
+-    const uint32_t asls=pci->configRead32(0xFC);
+-    uint32_t source=0;
+-    if(asls && asls<=0xFFFFE000U) {
+-        auto memory=IOMemoryDescriptor::withPhysicalAddress(asls,8192,kIODirectionIn);
+-        auto mapping=memory ? memory->map(kIOMapReadOnly) : nullptr;
+-        if(mapping && mapping->getVirtualAddress() && mapping->getLength()>=8192) {
+-            const auto bytes=reinterpret_cast<const uint8_t *>(mapping->getVirtualAddress());
+-            const auto region=XELP::VBT::region(bytes,8192,asls);
+-            if(region.valid) {
+-                // Preserve existing diagnostics for collectors.
+-                pci->setProperty("TGLASLS",asls,32);
+-                publishBytes(pci,"TGLOpRegion",bytes,8192);
+-                if(region.address) {
+-                    auto vbtMemory=IOMemoryDescriptor::withPhysicalAddress(region.address,region.bytes,kIODirectionIn);
+-                    auto vbtMap=vbtMemory ? vbtMemory->map(kIOMapReadOnly) : nullptr;
+-                    if(vbtMap && vbtMap->getVirtualAddress() && vbtMap->getLength()>=region.bytes) {
+-                        const auto data=reinterpret_cast<const void *>(vbtMap->getVirtualAddress());
+-                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family);
+-                        if(firmwarePorts.valid()){source=2;publishBytes(pci,"TGLVBT",data,firmwarePorts.bytes);}
+-                    }
+-                    if(vbtMap)vbtMap->release();
+-                    if(vbtMemory)vbtMemory->release();
+-                }
+-                if(!firmwarePorts.valid()) {
+-                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family);
+-                    if(embedded.valid()) {
+-                        firmwarePorts=embedded;source=1;
+-                        publishBytes(pci,"TGLVBT",bytes+0x400,firmwarePorts.bytes);
+-                    } else if(firmwarePorts.status==XELP::VBT::Status::Missing)firmwarePorts=embedded;
+-                }
+-            }
+-        }
+-        if(mapping)mapping->release();
+-        if(memory)memory->release();
+-    }
+-    const auto hdmi=firmwarePorts.hdmi(3); // physical Combo A/B on both admitted families
+-    uint32_t summary[]={1,static_cast<uint32_t>(firmwarePorts.status),source,firmwarePorts.version,
+-        firmwarePorts.present,firmwarePorts.unmapped,firmwarePorts.ambiguous,hdmi.valid,hdmi.hdmi,
+-        hdmi.ddc[0],hdmi.ddc[1],hdmi.ddc[2]};
+-    pci->setProperty("WhateverXeFirmwarePorts",summary,sizeof(summary));
+-    pci->setProperty("WhateverXeFirmwareChecksum",firmwarePorts.checksum,32);
+-    pci->setProperty("WhateverXeFirmwarePortRecords",firmwarePorts.port,sizeof(firmwarePorts.port));
+-    const auto &panel=firmwarePorts.panel;
+-    uint32_t panelFacts[]={panel.valid,panel.type,panel.ddi,panel.lowSwing,panel.hobl};
+-    pci->setProperty("WhateverXeFirmwarePanel",panelFacts,sizeof(panelFacts));
+-    if(checkKernelArgument("-wex-dsi-audit")) {
+-        // Synchronous audit of the existing copied firmware property. Never
+-        // retain borrowed sequence pointers, acquire power, or authorize IO.
+-        const auto vbt=OSDynamicCast(OSData,pci->getProperty("TGLVBT"));
+-        const auto profile=XELP::DSI::parseProfile({vbt?static_cast<const uint8_t *>(vbt->getBytesNoCopy()):nullptr,
+-            vbt?vbt->getLength():0U},true);
+-        const auto link=XELP::DSI::linkPlan(profile);
+-        uint32_t audit[]={1,static_cast<uint32_t>(profile.status),profile.bdbTailQuirk,
+-            profile.version,profile.checksum,profile.panel,profile.lanes,
+-            profile.mode.width,profile.mode.height,profile.mode.clockKHz,profile.mode.htotal(),profile.mode.vtotal(),
+-            profile.pwmHz,profile.minimum,profile.brightness,profile.precision,
+-            profile.sequences.packets,profile.sequences.delays,profile.sequences.gpios,
+-            uint32_t(profile.sequences.delayUs),uint32_t(profile.sequences.delayUs>>32),
+-            profile.ppsUs[0],profile.ppsUs[1],profile.ppsUs[2],profile.ppsUs[3],profile.ppsUs[4],
+-            link.valid,link.afeKHz,link.portKHz,link.escapeDivider,link.phyEscapeDivider,
+-            link.clockTiming,link.dataTiming};
+-        publishBytes(pci,"WEXDSIFirmwareAudit",audit,sizeof(audit));
+-    }
+-}
++#include "kern_xe.hpp"
++#include "kern_dsi_math.hpp"
++#include <IOKit/pci/IOPCIDevice.h>
++#include <IOKit/IOMemoryDescriptor.h>
++
++static void publishBytes(IOPCIDevice *pci,const char *key,const void *bytes,unsigned length) {
++    auto data=OSData::withBytes(bytes,length);
++    if(data){pci->setProperty(key,data);data->release();}
++}
++
++// Firmware is read once, before topology/hook selection. No PCI BAR/ROM scan,
++// power acquisition, or MMIO probing occurs here. Explicit properties win later.
++void XE::xelpReadFirmware(IOPCIDevice *pci) {
++    // Wiring is needed by framebuffer-only profiles before Render is admitted.
++    if(!pci || !xeProfile.displayAdmitted())return;
++    const uint32_t asls=pci->configRead32(0xFC);
++    uint32_t source=0;
++    if(asls && asls<=0xFFFFE000U) {
++        auto memory=IOMemoryDescriptor::withPhysicalAddress(asls,8192,kIODirectionIn);
++        auto mapping=memory ? memory->map(kIOMapReadOnly) : nullptr;
++        if(mapping && mapping->getVirtualAddress() && mapping->getLength()>=8192) {
++            const auto bytes=reinterpret_cast<const uint8_t *>(mapping->getVirtualAddress());
++            const auto region=XELP::VBT::region(bytes,8192,asls);
++            if(region.valid) {
++                // Preserve existing diagnostics for collectors.
++                pci->setProperty("TGLASLS",asls,32);
++                publishBytes(pci,"TGLOpRegion",bytes,8192);
++                if(region.address) {
++                    auto vbtMemory=IOMemoryDescriptor::withPhysicalAddress(region.address,region.bytes,kIODirectionIn);
++                    auto vbtMap=vbtMemory ? vbtMemory->map(kIOMapReadOnly) : nullptr;
++                    if(vbtMap && vbtMap->getVirtualAddress() && vbtMap->getLength()>=region.bytes) {
++                        const auto data=reinterpret_cast<const void *>(vbtMap->getVirtualAddress());
++                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family);
++                        if(firmwarePorts.valid()){source=2;publishBytes(pci,"TGLVBT",data,firmwarePorts.bytes);}
++                    }
++                    if(vbtMap)vbtMap->release();
++                    if(vbtMemory)vbtMemory->release();
++                }
++                if(!firmwarePorts.valid()) {
++                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family);
++                    if(embedded.valid()) {
++                        firmwarePorts=embedded;source=1;
++                        publishBytes(pci,"TGLVBT",bytes+0x400,firmwarePorts.bytes);
++                    } else if(firmwarePorts.status==XELP::VBT::Status::Missing)firmwarePorts=embedded;
++                }
++            }
++        }
++        if(mapping)mapping->release();
++        if(memory)memory->release();
++    }
++    const auto hdmi=firmwarePorts.hdmi(3); // physical Combo A/B on both admitted families
++    uint32_t summary[]={1,static_cast<uint32_t>(firmwarePorts.status),source,firmwarePorts.version,
++        firmwarePorts.present,firmwarePorts.unmapped,firmwarePorts.ambiguous,hdmi.valid,hdmi.hdmi,
++        hdmi.ddc[0],hdmi.ddc[1],hdmi.ddc[2]};
++    pci->setProperty("WhateverXeFirmwarePorts",summary,sizeof(summary));
++    pci->setProperty("WhateverXeFirmwareChecksum",firmwarePorts.checksum,32);
++    pci->setProperty("WhateverXeFirmwarePortRecords",firmwarePorts.port,sizeof(firmwarePorts.port));
++    // Opt-in AUX/DPCD backlight admission (OLED eDP, VBT backlight_control type 5).
++    if(checkKernelArgument("-wex-auxbl") && firmwarePorts.panel.valid &&
++       firmwarePorts.panel.backlightValid && firmwarePorts.panel.backlightType==5)
++        firmwarePorts.panel.auxBacklight=true;
++    const auto &panel=firmwarePorts.panel;
++    uint32_t panelFacts[]={panel.valid,panel.type,panel.ddi,panel.lowSwing,panel.hobl};
++    pci->setProperty("WhateverXeFirmwarePanel",panelFacts,sizeof(panelFacts));
++    uint32_t backlightFacts[]={panel.backlightValid,panel.pwmPresent,panel.activeLowPWM,
++        panel.backlightType,panel.controller,panel.pwmHz,panel.auxBacklight};
++    pci->setProperty("WhateverXeFirmwarePanelBacklight",backlightFacts,sizeof(backlightFacts));
++    SYSLOG("igfx","VBT panel backlight valid=%u pwm=%u type=%u controller=%u hz=%u aux-admitted=%u",
++        panel.backlightValid,panel.pwmPresent,panel.backlightType,panel.controller,panel.pwmHz,panel.auxBacklight);
++    if(checkKernelArgument("-wex-dsi-audit")) {
++        // Synchronous audit of the existing copied firmware property. Never
++        // retain borrowed sequence pointers, acquire power, or authorize IO.
++        const auto vbt=OSDynamicCast(OSData,pci->getProperty("TGLVBT"));
++        const auto profile=XELP::DSI::parseProfile({vbt?static_cast<const uint8_t *>(vbt->getBytesNoCopy()):nullptr,
++            vbt?vbt->getLength():0U},true);
++        const auto link=XELP::DSI::linkPlan(profile);
++        uint32_t audit[]={1,static_cast<uint32_t>(profile.status),profile.bdbTailQuirk,
++            profile.version,profile.checksum,profile.panel,profile.lanes,
++            profile.mode.width,profile.mode.height,profile.mode.clockKHz,profile.mode.htotal(),profile.mode.vtotal(),
++            profile.pwmHz,profile.minimum,profile.brightness,profile.precision,
++            profile.sequences.packets,profile.sequences.delays,profile.sequences.gpios,
++            uint32_t(profile.sequences.delayUs),uint32_t(profile.sequences.delayUs>>32),
++            profile.ppsUs[0],profile.ppsUs[1],profile.ppsUs[2],profile.ppsUs[3],profile.ppsUs[4],
++            link.valid,link.afeKHz,link.portKHz,link.escapeDivider,link.phyEscapeDivider,
++            link.clockTiming,link.dataTiming};
++        publishBytes(pci,"WEXDSIFirmwareAudit",audit,sizeof(audit));
++    }
++}
+diff --git a/WhateverXe/kern_vbt.hpp b/WhateverXe/kern_vbt.hpp
+index a8022a2..a47a409 100644
+--- a/WhateverXe/kern_vbt.hpp
++++ b/WhateverXe/kern_vbt.hpp
+@@ -1,217 +1,220 @@
+-// Bounded firmware facts, separate from donor ABI and runtime link state.
+-// Wire offsets/port numbering checked against Intel VBT definitions in Linux
+-// v6.12. This parser is independently implemented; no Linux code is included.
+-#ifndef KERN_VBT_HPP
+-#define KERN_VBT_HPP
+-#include <stdint.h>
+-#include <stddef.h>
+-#include <string.h>
+-#include "kern_xelp_platform.hpp"
+-#include "kern_tgl_hdmi_wiring.hpp"
+-namespace XELP { namespace VBT {
+-inline uint16_t u16(const uint8_t *p) {return uint16_t(uint16_t(p[0]) | uint16_t(p[1])<<8);}
+-inline uint32_t u32(const uint8_t *p) {return uint32_t(u16(p)) | uint32_t(u16(p+2))<<16;}
+-inline uint64_t u64(const uint8_t *p) {return uint64_t(u32(p)) | uint64_t(u32(p+4))<<32;}
+-enum class Status : uint32_t { Missing, Valid, Header, Checksum, Blocks, Version, Children, Conflict, Platform };
+-struct Port {
+-    uint32_t type {},dvo {},ddc {},aux {},flags {},capabilities {};
+-    uint32_t hdmiPreset {UINT32_MAX}; // BDB child byte7, table index; absent firmware uses default.
+-    // flags preserves byte23 (lane reversal, LSPCON, HPD polarity, lane count).
+-    // capabilities preserves byte33 (USB-C/TBT capabilities, NOT current mode).
+-    bool dp() const {return type&4;}
+-    bool internal() const {return type&0x1000;}
+-    bool tmdsOnly() const {return (type&0x12)==0x12 && !(type&(4|0x1000|0x400|0x20|1)) &&
+-        !(flags&0x17);}
+-    bool fixedTMDS() const {return tmdsOnly() && !(capabilities&3);}
+-};
+-struct Ports {
+-    Status status {Status::Missing};
+-    uint32_t version {},bytes {},present {},unmapped {},ambiguous {};
+-    uint32_t checksum {};
+-    struct Panel {
+-        bool valid {},lowSwing {},hobl {};
+-        uint32_t type {},ddi {PortCount};
+-        // BDB 27: five little-endian 100us delays per panel, including T12.
+-        uint16_t delays[5] {};
+-        // BDB 43 is optional and independent of the signal-policy facts.
+-        bool backlightValid {},pwmPresent {},activeLowPWM {};
+-        uint32_t backlightType {},controller {},pwmHz {};
+-    } panel;
+-    Port port[PortCount];
+-    bool valid() const {return status==Status::Valid;}
+-    // Linux direct_aux_ch_map: A=0x40, B/C/D=0x10/0x20/0x30, E..I=0x50..0x90.
+-    static uint32_t tglTCAux(unsigned ddi) {return ddi>=3 && ddi<PortCount ? (ddi==3?0x30U:(ddi+1)*0x10U) : 0;}
+-    // USB-C DP-alt uses the native mode3 owner, not the fixed-DP mode4
+-    // backend. VBT AUX D is 0x30 (A is 0x40), then E..I are 0x50..0x90.
+-    uint32_t tglDPAltCandidates(uint32_t backend) const {
+-        if(!valid())return 0;
+-        uint32_t result=0;
+-        for(unsigned d=3;d<PortCount;++d) {
+-            const auto &p=port[d];
+-            bool shared=false;
+-            for(unsigned other=0;other<PortCount;++other)
+-                if(other!=d && (present&(1U<<other)) && port[other].dp() && port[other].aux==p.aux)shared=true;
+-            if((present&backend&(1U<<d)) && p.dp() && !p.internal() &&
+-               !(p.type&(0x400|0x20|1)) && !(p.flags&0x17) && (p.capabilities&1) &&
+-               !shared && p.aux==tglTCAux(d))result|=1U<<d;
+-        }
+-        return result;
+-    }
+-    // TGL external DP candidates, not a fixed/alt/TBT mode decision. Current
+-    // native AUX routing follows DDI; different firmware AUX needs a backend.
+-    uint32_t tglDPCandidates(uint32_t backend) const {
+-        if(!valid())return 0;
+-        uint32_t result=0;
+-        for(unsigned d=3;d<PortCount;++d) {
+-            const auto &p=port[d];
+-            bool shared=false;
+-            for(unsigned other=0;other<PortCount;++other)
+-                if(other!=d && (present&(1U<<other)) && port[other].dp() && port[other].aux==p.aux)shared=true;
+-            if((present&backend&(1U<<d)) && (p.type&0x14)==0x14 &&
+-               !(p.type&(0x1000|0x400|0x20|1)) && !(p.flags&0x17) &&
+-               !shared && p.aux==tglTCAux(d))result|=1U<<d;
+-        }
+-        return result;
+-    }
+-    TGLHDMIWiring hdmi(uint32_t backend) const {
+-        auto w=TGLHDMIWiring::empty();
+-        if(!valid())return w; // no guessed wiring; caller retains existing guards
+-        uint32_t used=0;
+-        for(unsigned d=0;d<3;++d) {
+-            if(!(present&backend&(1U<<d)) || !port[d].fixedTMDS())continue;
+-            const auto pin=port[d].ddc;
+-            if(pin<1 || pin>3 || (used&(1U<<pin)))return {}; // ambiguous DDC ownership
+-            used|=1U<<pin;w.hdmi|=1U<<d;w.ddc[d]=pin;
+-        }
+-        return w;
+-    }
+-};
+-// Optional panel facts must never weaken General Definitions admission or
+-// make an unrelated malformed firmware tail reject usable connector facts.
+-inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports) {
+-    const uint8_t *options=nullptr,*edp=nullptr,*power=nullptr,*backlight=nullptr;
+-    size_t optionsSize=0,edpSize=0,powerSize=0,backlightSize=0;
+-    bool duplicate=false,backlightDuplicate=false;
+-    for(size_t at=header;at<size;) {
+-        if(size-at<3)break;
+-        size_t n=u16(b+at+1);
+-        if(b[at]==53 && size-at>=4 && b[at+3]>=3) {
+-            if(size-at<8)break;
+-            n=u32(b+at+4);
+-        }
+-        if(n>size-at-3)break;
+-        auto block=b+at+3;
+-        if(b[at]==40){duplicate|=options!=nullptr;options=block;optionsSize=n;}
+-        if(b[at]==27){duplicate|=edp!=nullptr;edp=block;edpSize=n;}
+-        if(b[at]==43){backlightDuplicate|=backlight!=nullptr;backlight=block;backlightSize=n;}
+-        if(b[at]==44){duplicate|=power!=nullptr;power=block;powerSize=n;}
+-        at+=3+n;
+-    }
+-    if(duplicate || !options || optionsSize<1 || options[0]>=16 ||
+-       !edp || edpSize<212 || (ports.version>=232 && (!power || powerSize<56)))return;
+-    unsigned internal=PortCount;
+-    for(unsigned d=0;d<PortCount;++d)if((ports.present&(1U<<d)) &&
+-        ports.port[d].internal() && ports.port[d].dp()) {
+-        if(internal!=PortCount)return; // no guessed panel/connector association
+-        internal=d;
+-    }
+-    if(internal==PortCount)return;
+-    auto &p=ports.panel;
+-    p.type=options[0];p.ddi=internal;
+-    p.lowSwing=((u64(edp+204)>>(4*p.type))&15)==0;
+-    p.hobl=ports.version>=232 && (u16(power+54)&(1U<<p.type));
+-    p.valid=true;
+-    for(unsigned i=0;i<5;++i)p.delays[i]=u16(edp+10*p.type+2*i);
+-    if(!backlightDuplicate && backlight && backlightSize>=129 && backlight[0]==6) {
+-        const auto entry=backlight+1+6*p.type;
+-        p.pwmPresent=(entry[0]&3)==2;p.activeLowPWM=entry[0]&4;
+-        p.pwmHz=u16(entry+1);
+-        p.backlightType=backlight[113+p.type]&15;
+-        p.controller=backlight[113+p.type]>>4;
+-        p.backlightValid=true;
+-    }
+-}
+-// Return the donor's physical-DDI slot, never an FB index. Display13 VBT
+-// retains C/D/E labels even on ADL-N, whose physical Combo set is only A/B.
+-inline uint32_t ddi(Family family,uint32_t dvo) {
+-    const auto adapter=displayAdapter(family);
+-    const uint8_t dp[]={10,7,8,9,11,13,15,17,19};
+-    const uint8_t hd[]={0,1,2,3,12,14,16,18,20};
+-    for(unsigned p=0;p<9;++p)if(dvo==dp[p] || dvo==hd[p]) {
+-        if(adapter==DisplayAdapter::TGL)return p==2 ? PortCount : p;
+-        if((adapter==DisplayAdapter::ADLN || adapter==DisplayAdapter::ADLP))return p<2 ? p : p>=5 ? p-2 : PortCount;
+-        if(adapter==DisplayAdapter::ADLS)return p==0 ? 0 : p<5 ? p+2 : PortCount;
+-    }
+-    return PortCount;
+-}
+-inline Ports parse(const void *data,size_t length,Family family) {
+-    Ports r;
+-    if(!data || !length)return r;
+-    if(displayAdapter(family)==DisplayAdapter::Unknown){r.status=Status::Platform;return r;}
+-    const auto p=static_cast<const uint8_t *>(data);r.status=Status::Header;
+-    if(length<48 || memcmp(p,"$VBT",4))return r;
+-    const size_t header=u16(p+22),size=u16(p+24),bdb=u32(p+28);
+-    if(header<48 || size<header || size>length || bdb<header || bdb>size || size-bdb<22)return r;
+-    // Firmware may update runtime fields without a matching table checksum.
+-    // Like i915, admit by bounded structure and connector semantics; retain
+-    // the checksum residue for diagnosis, never rewrite the firmware bytes.
+-    uint8_t sum=0;for(size_t i=0;i<size;++i)sum+=p[i];
+-    r.checksum=sum;
+-    const auto b=p+bdb;const size_t bh=u16(b+18),bs=u16(b+20);
+-    if(memcmp(b,"BIOS_DATA_BLOCK ",16) || bh<22 || bs<bh || bs>size-bdb)return r;
+-    r.version=u16(b+16);r.bytes=static_cast<uint32_t>(size);
+-    // Reviewed field layout. Unknown future versions never become board facts.
+-    if(r.version<216 || r.version>256){r.status=Status::Version;return r;}
+-    r.status=Status::Blocks;const uint8_t *children=nullptr;size_t childBytes=0;
+-    for(size_t at=bh;at<bs;) {
+-        if(bs-at<3)return r;
+-        size_t count=u16(b+at+1);
+-        if(b[at]==53) { // MIPI sequence v3 uses a 32-bit block length
+-            if(bs-at<4)return r;
+-            if(b[at+3]>=3){if(bs-at<8)return r;count=u32(b+at+4);}
+-        }
+-        if(count>bs-at-3)return r;
+-        // Consume only General Definitions; unrelated later blocks need not
+-        // parse successfully (real firmware has off-by-one BDB tail sizes).
+-        if(b[at]==2){children=b+at+3;childBytes=count;break;}
+-        at+=3+count;
+-    }
+-    r.status=Status::Children;
+-    if(!children || childBytes<5)return r;
+-    const auto stride=children[4];
+-    if(stride<38 || stride>64 || (childBytes-5)%stride)return r;
+-    for(size_t at=5;at<childBytes;at+=stride) {
+-        const auto c=children+at;const auto type=u16(c+2);
+-        // Non-digital placeholders have no DVO association. ADL-S firmware
+-        // includes TV/CRT entries with DVO0 alongside the real digital A.
+-        if(!(type&2))continue;
+-        const auto d=ddi(family,c[16]);
+-        if(d==PortCount){++r.unmapped;continue;}
+-        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
+-        auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
+-        r.present|=1U<<d;
+-        if(!q.fixedTMDS())r.ambiguous|=1U<<d;
+-    }
+-    r.status=Status::Valid;panelFacts(b,bh,bs,r);return r;
+-}
+-// OpRegion acquisition descriptor, kept pure for malformed/overflow testing.
+-struct Region {uint64_t address {};uint32_t bytes {},inlineBytes {};bool valid {};};
+-inline Region region(const void *data,size_t length,uint32_t asls) {
+-    Region r;const auto p=static_cast<const uint8_t *>(data);
+-    if(!p || length<8192 || !asls || asls>0xFFFFE000U || memcmp(p,"IntelGraphicsMem",16) || u32(p+16)<8)return r;
+-    r.valid=true;const auto boxes=u32(p+0x58);
+-    r.inlineBytes=((boxes&0x10)?0x1C00:8192)-0x400;
+-    if(p[23]!=2 || !(boxes&4))return r;
+-    auto address=u64(p+0x3BA);const auto bytes=u32(p+0x3C2);
+-    if(!address || bytes<48 || bytes>65536)return r;
+-    if(p[22]>=1){if(address<8192 || address>UINT64_MAX-asls)return r;address+=asls;}
+-    // x86 physical-address ceiling; reject overflow before mapping firmware.
+-    if(address>0xFFFFFFFFFFFFFULL || bytes>0x10000000000000ULL-address)return r;
+-    r.address=address;r.bytes=bytes;return r;
+-}
+-inline TGLHDMIWiring selectHDMI(bool explicitProperty,const void *bytes,uint32_t length,
+-                                 const Ports &firmware,uint32_t backend) {
+-    return explicitProperty ? TGLHDMIWiring::fromProperty(bytes,length) : firmware.hdmi(backend);
+-}
+-} }
+-#endif
++// Bounded firmware facts, separate from donor ABI and runtime link state.
++// Wire offsets/port numbering checked against Intel VBT definitions in Linux
++// v6.12. This parser is independently implemented; no Linux code is included.
++#ifndef KERN_VBT_HPP
++#define KERN_VBT_HPP
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include "kern_xelp_platform.hpp"
++#include "kern_tgl_hdmi_wiring.hpp"
++namespace XELP { namespace VBT {
++inline uint16_t u16(const uint8_t *p) {return uint16_t(uint16_t(p[0]) | uint16_t(p[1])<<8);}
++inline uint32_t u32(const uint8_t *p) {return uint32_t(u16(p)) | uint32_t(u16(p+2))<<16;}
++inline uint64_t u64(const uint8_t *p) {return uint64_t(u32(p)) | uint64_t(u32(p+4))<<32;}
++enum class Status : uint32_t { Missing, Valid, Header, Checksum, Blocks, Version, Children, Conflict, Platform };
++struct Port {
++    uint32_t type {},dvo {},ddc {},aux {},flags {},capabilities {};
++    uint32_t hdmiPreset {UINT32_MAX}; // BDB child byte7, table index; absent firmware uses default.
++    // flags preserves byte23 (lane reversal, LSPCON, HPD polarity, lane count).
++    // capabilities preserves byte33 (USB-C/TBT capabilities, NOT current mode).
++    bool dp() const {return type&4;}
++    bool internal() const {return type&0x1000;}
++    bool tmdsOnly() const {return (type&0x12)==0x12 && !(type&(4|0x1000|0x400|0x20|1)) &&
++        !(flags&0x17);}
++    bool fixedTMDS() const {return tmdsOnly() && !(capabilities&3);}
++};
++struct Ports {
++    Status status {Status::Missing};
++    uint32_t version {},bytes {},present {},unmapped {},ambiguous {};
++    uint32_t checksum {};
++    struct Panel {
++        bool valid {},lowSwing {},hobl {};
++        uint32_t type {},ddi {PortCount};
++        // BDB 27: five little-endian 100us delays per panel, including T12.
++        uint16_t delays[5] {};
++        // BDB 43 is optional and independent of the signal-policy facts.
++        bool backlightValid {},pwmPresent {},activeLowPWM {};
++        uint32_t backlightType {},controller {},pwmHz {};
++        // Opt-in (-wex-auxbl): VBT backlight_control type 5 (VESA eDP AUX/DPCD,
++        // typical for OLED) admitted for panel adoption. PWM writes stay inert.
++        bool auxBacklight {};
++    } panel;
++    Port port[PortCount];
++    bool valid() const {return status==Status::Valid;}
++    // Linux direct_aux_ch_map: A=0x40, B/C/D=0x10/0x20/0x30, E..I=0x50..0x90.
++    static uint32_t tglTCAux(unsigned ddi) {return ddi>=3 && ddi<PortCount ? (ddi==3?0x30U:(ddi+1)*0x10U) : 0;}
++    // USB-C DP-alt uses the native mode3 owner, not the fixed-DP mode4
++    // backend. VBT AUX D is 0x30 (A is 0x40), then E..I are 0x50..0x90.
++    uint32_t tglDPAltCandidates(uint32_t backend) const {
++        if(!valid())return 0;
++        uint32_t result=0;
++        for(unsigned d=3;d<PortCount;++d) {
++            const auto &p=port[d];
++            bool shared=false;
++            for(unsigned other=0;other<PortCount;++other)
++                if(other!=d && (present&(1U<<other)) && port[other].dp() && port[other].aux==p.aux)shared=true;
++            if((present&backend&(1U<<d)) && p.dp() && !p.internal() &&
++               !(p.type&(0x400|0x20|1)) && !(p.flags&0x17) && (p.capabilities&1) &&
++               !shared && p.aux==tglTCAux(d))result|=1U<<d;
++        }
++        return result;
++    }
++    // TGL external DP candidates, not a fixed/alt/TBT mode decision. Current
++    // native AUX routing follows DDI; different firmware AUX needs a backend.
++    uint32_t tglDPCandidates(uint32_t backend) const {
++        if(!valid())return 0;
++        uint32_t result=0;
++        for(unsigned d=3;d<PortCount;++d) {
++            const auto &p=port[d];
++            bool shared=false;
++            for(unsigned other=0;other<PortCount;++other)
++                if(other!=d && (present&(1U<<other)) && port[other].dp() && port[other].aux==p.aux)shared=true;
++            if((present&backend&(1U<<d)) && (p.type&0x14)==0x14 &&
++               !(p.type&(0x1000|0x400|0x20|1)) && !(p.flags&0x17) &&
++               !shared && p.aux==tglTCAux(d))result|=1U<<d;
++        }
++        return result;
++    }
++    TGLHDMIWiring hdmi(uint32_t backend) const {
++        auto w=TGLHDMIWiring::empty();
++        if(!valid())return w; // no guessed wiring; caller retains existing guards
++        uint32_t used=0;
++        for(unsigned d=0;d<3;++d) {
++            if(!(present&backend&(1U<<d)) || !port[d].fixedTMDS())continue;
++            const auto pin=port[d].ddc;
++            if(pin<1 || pin>3 || (used&(1U<<pin)))return {}; // ambiguous DDC ownership
++            used|=1U<<pin;w.hdmi|=1U<<d;w.ddc[d]=pin;
++        }
++        return w;
++    }
++};
++// Optional panel facts must never weaken General Definitions admission or
++// make an unrelated malformed firmware tail reject usable connector facts.
++inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports) {
++    const uint8_t *options=nullptr,*edp=nullptr,*power=nullptr,*backlight=nullptr;
++    size_t optionsSize=0,edpSize=0,powerSize=0,backlightSize=0;
++    bool duplicate=false,backlightDuplicate=false;
++    for(size_t at=header;at<size;) {
++        if(size-at<3)break;
++        size_t n=u16(b+at+1);
++        if(b[at]==53 && size-at>=4 && b[at+3]>=3) {
++            if(size-at<8)break;
++            n=u32(b+at+4);
++        }
++        if(n>size-at-3)break;
++        auto block=b+at+3;
++        if(b[at]==40){duplicate|=options!=nullptr;options=block;optionsSize=n;}
++        if(b[at]==27){duplicate|=edp!=nullptr;edp=block;edpSize=n;}
++        if(b[at]==43){backlightDuplicate|=backlight!=nullptr;backlight=block;backlightSize=n;}
++        if(b[at]==44){duplicate|=power!=nullptr;power=block;powerSize=n;}
++        at+=3+n;
++    }
++    if(duplicate || !options || optionsSize<1 || options[0]>=16 ||
++       !edp || edpSize<212 || (ports.version>=232 && (!power || powerSize<56)))return;
++    unsigned internal=PortCount;
++    for(unsigned d=0;d<PortCount;++d)if((ports.present&(1U<<d)) &&
++        ports.port[d].internal() && ports.port[d].dp()) {
++        if(internal!=PortCount)return; // no guessed panel/connector association
++        internal=d;
++    }
++    if(internal==PortCount)return;
++    auto &p=ports.panel;
++    p.type=options[0];p.ddi=internal;
++    p.lowSwing=((u64(edp+204)>>(4*p.type))&15)==0;
++    p.hobl=ports.version>=232 && (u16(power+54)&(1U<<p.type));
++    p.valid=true;
++    for(unsigned i=0;i<5;++i)p.delays[i]=u16(edp+10*p.type+2*i);
++    if(!backlightDuplicate && backlight && backlightSize>=129 && backlight[0]==6) {
++        const auto entry=backlight+1+6*p.type;
++        p.pwmPresent=(entry[0]&3)==2;p.activeLowPWM=entry[0]&4;
++        p.pwmHz=u16(entry+1);
++        p.backlightType=backlight[113+p.type]&15;
++        p.controller=backlight[113+p.type]>>4;
++        p.backlightValid=true;
++    }
++}
++// Return the donor's physical-DDI slot, never an FB index. Display13 VBT
++// retains C/D/E labels even on ADL-N, whose physical Combo set is only A/B.
++inline uint32_t ddi(Family family,uint32_t dvo) {
++    const auto adapter=displayAdapter(family);
++    const uint8_t dp[]={10,7,8,9,11,13,15,17,19};
++    const uint8_t hd[]={0,1,2,3,12,14,16,18,20};
++    for(unsigned p=0;p<9;++p)if(dvo==dp[p] || dvo==hd[p]) {
++        if(adapter==DisplayAdapter::TGL)return p==2 ? PortCount : p;
++        if((adapter==DisplayAdapter::ADLN || adapter==DisplayAdapter::ADLP))return p<2 ? p : p>=5 ? p-2 : PortCount;
++        if(adapter==DisplayAdapter::ADLS)return p==0 ? 0 : p<5 ? p+2 : PortCount;
++    }
++    return PortCount;
++}
++inline Ports parse(const void *data,size_t length,Family family) {
++    Ports r;
++    if(!data || !length)return r;
++    if(displayAdapter(family)==DisplayAdapter::Unknown){r.status=Status::Platform;return r;}
++    const auto p=static_cast<const uint8_t *>(data);r.status=Status::Header;
++    if(length<48 || memcmp(p,"$VBT",4))return r;
++    const size_t header=u16(p+22),size=u16(p+24),bdb=u32(p+28);
++    if(header<48 || size<header || size>length || bdb<header || bdb>size || size-bdb<22)return r;
++    // Firmware may update runtime fields without a matching table checksum.
++    // Like i915, admit by bounded structure and connector semantics; retain
++    // the checksum residue for diagnosis, never rewrite the firmware bytes.
++    uint8_t sum=0;for(size_t i=0;i<size;++i)sum+=p[i];
++    r.checksum=sum;
++    const auto b=p+bdb;const size_t bh=u16(b+18),bs=u16(b+20);
++    if(memcmp(b,"BIOS_DATA_BLOCK ",16) || bh<22 || bs<bh || bs>size-bdb)return r;
++    r.version=u16(b+16);r.bytes=static_cast<uint32_t>(size);
++    // Reviewed field layout. Unknown future versions never become board facts.
++    if(r.version<216 || r.version>256){r.status=Status::Version;return r;}
++    r.status=Status::Blocks;const uint8_t *children=nullptr;size_t childBytes=0;
++    for(size_t at=bh;at<bs;) {
++        if(bs-at<3)return r;
++        size_t count=u16(b+at+1);
++        if(b[at]==53) { // MIPI sequence v3 uses a 32-bit block length
++            if(bs-at<4)return r;
++            if(b[at+3]>=3){if(bs-at<8)return r;count=u32(b+at+4);}
++        }
++        if(count>bs-at-3)return r;
++        // Consume only General Definitions; unrelated later blocks need not
++        // parse successfully (real firmware has off-by-one BDB tail sizes).
++        if(b[at]==2){children=b+at+3;childBytes=count;break;}
++        at+=3+count;
++    }
++    r.status=Status::Children;
++    if(!children || childBytes<5)return r;
++    const auto stride=children[4];
++    if(stride<38 || stride>64 || (childBytes-5)%stride)return r;
++    for(size_t at=5;at<childBytes;at+=stride) {
++        const auto c=children+at;const auto type=u16(c+2);
++        // Non-digital placeholders have no DVO association. ADL-S firmware
++        // includes TV/CRT entries with DVO0 alongside the real digital A.
++        if(!(type&2))continue;
++        const auto d=ddi(family,c[16]);
++        if(d==PortCount){++r.unmapped;continue;}
++        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
++        auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
++        r.present|=1U<<d;
++        if(!q.fixedTMDS())r.ambiguous|=1U<<d;
++    }
++    r.status=Status::Valid;panelFacts(b,bh,bs,r);return r;
++}
++// OpRegion acquisition descriptor, kept pure for malformed/overflow testing.
++struct Region {uint64_t address {};uint32_t bytes {},inlineBytes {};bool valid {};};
++inline Region region(const void *data,size_t length,uint32_t asls) {
++    Region r;const auto p=static_cast<const uint8_t *>(data);
++    if(!p || length<8192 || !asls || asls>0xFFFFE000U || memcmp(p,"IntelGraphicsMem",16) || u32(p+16)<8)return r;
++    r.valid=true;const auto boxes=u32(p+0x58);
++    r.inlineBytes=((boxes&0x10)?0x1C00:8192)-0x400;
++    if(p[23]!=2 || !(boxes&4))return r;
++    auto address=u64(p+0x3BA);const auto bytes=u32(p+0x3C2);
++    if(!address || bytes<48 || bytes>65536)return r;
++    if(p[22]>=1){if(address<8192 || address>UINT64_MAX-asls)return r;address+=asls;}
++    // x86 physical-address ceiling; reject overflow before mapping firmware.
++    if(address>0xFFFFFFFFFFFFFULL || bytes>0x10000000000000ULL-address)return r;
++    r.address=address;r.bytes=bytes;return r;
++}
++inline TGLHDMIWiring selectHDMI(bool explicitProperty,const void *bytes,uint32_t length,
++                                 const Ports &firmware,uint32_t backend) {
++    return explicitProperty ? TGLHDMIWiring::fromProperty(bytes,length) : firmware.hdmi(backend);
++}
++} }
++#endif
+diff --git a/WhateverXe/kern_xe.cpp b/WhateverXe/kern_xe.cpp
+index 7b8316b..03446a5 100644
+--- a/WhateverXe/kern_xe.cpp
++++ b/WhateverXe/kern_xe.cpp
+@@ -8370,6 +8370,51 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
+ }
+ 
+ 
++// Local diagnostics kept out of the bounded boot-handoff stack frame.
++// eDP boot handoff runs at controller start, before the donor probes ports and
++// records a port mode. Mirror the DSI adoption: the exact donor base
++// setPortMode(1) only records port+0x550; no HAL setter or reset callback runs.
++// Only the bound, firmware-driven internal panel port on Combo A/B qualifies.
++__attribute__((noinline)) void XE::display13AdoptEDPPortMode(OSObject *port,uint32_t ddi) {
++    auto self=callbackXE;auto &c=display13FBPower;
++    if(ddi>=2 || !(self->adlnOutputWiring.panel&(1U<<ddi)) || !self->display13TCBaseMode ||
++       !port || port->getMetaClass()->getClassSize()<0x6B0)return;
++    auto cfg=Display13FBMemory::field<uint32_t *>(port,0x548);
++    const auto previous=Display13FBMemory::field<uint32_t>(port,0x550);
++    const bool bound=cfg && cfg[0]==ddi && previous==0 && self->adlnOutputWiring.matches(cfg) &&
++        Display13FBTopology::bound(self->adlnPlatform,cfg,ddi) && c.controller &&
++        c.controller==self->adlnTopologyController && c.access &&
++        Display13FBMemory::field<void *>(port,0x578)==c.access &&
++        Display13FBMemory::field<uint32_t>(port,0x120)==ddi &&
++        !c.memoryFaulted && !c.clockFaulted && !c.bridge.state.faulted;
++    uint32_t rc=kIOReturnNotReady;
++    if(bound)rc=reinterpret_cast<uint32_t (*)(OSObject *,uint32_t)>(self->display13TCBaseMode)(port,1);
++    SYSLOG("igfx","Display13 eDP port mode adopt bound=%u previous=%u rc=%x mode=%u",
++        bound,previous,rc,Display13FBMemory::field<uint32_t>(port,0x550));
++}
++
++__attribute__((noinline)) void XE::display13SSTDiag(OSObject *po,bool dp) {
++    auto sx=callbackXE;auto &c=display13FBPower;
++    const bool sizeOk=po && po->getMetaClass()->getClassSize()>=0x624;
++    auto cfg=sizeOk ? Display13FBMemory::field<uint32_t *>(po,0x548) : nullptr;
++    SYSLOG("igfx","Display13 SST diag dp=%u hooks=%u req=%u size=%u ctrl=%u map=%u cf=%u mf=%u pf=%u cs=%u desc=%u",
++        dp,sx->display13FBSSTHooksReady,sx->display13FramebufferRequested,sizeOk,c.controller==sx->adlnTopologyController,
++        adlnWriterMappingBound(),c.clockFaulted,c.memoryFaulted,c.panelFaulted,c.clockStopped,sx->adlnOutputWiring.described());
++    SYSLOG("igfx","Display13 SST diag cfg0=%x sel=%u links=%x b117=%u p120=%x p550=%x acc=%u panel=%x dpw=%x hdmi=%x",
++        cfg?cfg[0]:0xffffffffU,cfg?Display13FBTopology::selected(sx->adlnPlatform,cfg,sx->adlnOutputWiring):false,
++        sx->adlnOutputWiring.links(),sizeOk?Display13FBMemory::field<uint8_t>(po,0x117):0xffU,
++        sizeOk?Display13FBMemory::field<uint32_t>(po,0x120):0xffffffffU,sizeOk?Display13FBMemory::field<uint32_t>(po,0x550):0xffffffffU,
++        sizeOk?(Display13FBMemory::field<void *>(po,0x578)==c.access):false,
++        sx->adlnOutputWiring.panel,sx->adlnOutputWiring.dp,sx->adlnOutputWiring.hdmi);
++}
++static __attribute__((noinline)) void display13AdoptDiag(const AlderLakeN::DisplayReadout &boot,uint32_t ddi) {
++    uint32_t v[12] {};const uint32_t regs[12]={0x60400,0x60404,0x60540,0x64000+0x100*ddi,0x46140,0x78000,0x78004,0x60030,0x60034,0x60040,0x60044,Display13Power::AUX};
++    for(unsigned i=0;i<12;++i)AlderLakeN::value(boot,regs[i],v[i]);
++    SYSLOG("igfx","Display13 adoptDPBootAUX reject mask=%x ddi=%u active=%x trans=%x ctl2=%x tp=%x buf=%x clk=%x",
++        AlderLakeN::adoptDPBootAUXMask,ddi,boot.activePipes,v[0],v[1],v[2],v[3],v[4]);
++    SYSLOG("igfx","Display13 adoptDPBootAUX regs dss=%x/%x dm=%x dn=%x lm=%x ln=%x aux=%x",v[5],v[6],v[7],v[8],v[9],v[10],v[11]);
++}
++
+ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop) {
+ 	FunctionCast(wrapAlderLakeNSetupWorkLoop,callbackXE->orgAlderLakeNSetupWorkLoop)(controller,workLoop);
+ 	auto &c=display13FBPower;if(!c.lock)return;
+@@ -8481,6 +8526,8 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
+                 const auto ddi=c.bridge.bootPort;
+                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
+                 bool linked=!dp;
++                if(dp)display13AdoptEDPPortMode(port,ddi);
++                display13SSTDiag(port,dp);
+                 if(dp && display13SSTPort(port)) {
+                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
+                     if(ddi>=3) {
+@@ -8491,6 +8538,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
+                     } else if(ddi<2) {
+                         result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
+                         linked=result.status==Display13Power::Status::Complete;
++                        if(!linked)display13AdoptDiag(boot,ddi);
+                         if(linked)port->retain(); // Released only after real buffer stop/idle.
+                     }
+                 }
+@@ -9322,6 +9370,66 @@ void XE::wrapAlderLakeNLatencyInit(IOService *controller) {
+ 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBLatency",record,sizeof(record));
+ }
+ 
++// The donor's adjust-pixel-clock routine returns a pointer into the CRTC record
++// on this eDP path (LG gram OLED, firmware GOP at 120 Hz). Derive the live pixel
++// rate from the firmware's PIPE_WM_LINETIME_A (1/8 us units, rounded up) instead,
++// using the half-step midpoint so the recomputed line time matches the register.
++// Display13 eDP VESA AUX/DPCD backlight (OLED panels, VBT backlight type 5).
++// The eDP AppleIntelPort is captured from the fb's own display path once the
++// donor programs timings; brightness 0..65535 maps to DPCD 0x722/0x723.
++static void *display13AuxPort {};
++static mach_vm_address_t display13ReadAUXFn {},display13WriteAUXFn {};
++static bool display13AuxReady {},display13AuxWide {},display13AuxEnable {},display13AuxEnabled {};
++static uint32_t display13AuxMax {},display13AuxCalls {};
++static __attribute__((noinline)) bool display13AuxBacklightSet(uint32_t brightness) {
++    auto port=display13AuxPort;
++    if(!port || !display13ReadAUXFn || !display13WriteAUXFn || brightness>65535)return false;
++    using AUXFn=uint32_t (*)(void *,uint32_t,void *,uint32_t);
++    const auto rd=reinterpret_cast<AUXFn>(display13ReadAUXFn),wr=reinterpret_cast<AUXFn>(display13WriteAUXFn);
++    if(!display13AuxReady) {
++        uint8_t cap[3] {},mode=0,bits[3] {};
++        const auto rc=rd(port,0x701,cap,3),rm=rd(port,0x721,&mode,1),rb=rd(port,0x724,bits,3);
++        display13AuxWide=(cap[1]&4)!=0;display13AuxEnable=(cap[0]&4)!=0;
++        uint32_t pn=bits[0]&0x1F;if(!pn)pn=bits[2]&0x1F;
++        if(!pn || pn>16)pn=display13AuxWide?16:8;
++        if(!display13AuxWide && pn>8)pn=8;
++        display13AuxMax=(1U<<pn)-1;
++        SYSLOG("igfx","Display13 AUX backlight caps rc=%x/%x/%x cap=%02x %02x %02x mode=%02x bits=%02x %02x %02x max=%u",
++            rc,rm,rb,cap[0],cap[1],cap[2],mode,bits[0],bits[1],bits[2],display13AuxMax);
++        if(rc || rm || !(cap[1]&2))return false; // BRIGHTNESS_AUX_SET_CAP
++        if((mode&3)!=2) {
++            uint8_t m=uint8_t((mode&~3U)|2U);const auto rw=wr(port,0x721,&m,1);
++            SYSLOG("igfx","Display13 AUX backlight mode %02x -> %02x rc=%x",mode,m,rw);
++            if(rw)return false;
++        }
++        display13AuxReady=true;
++    }
++    uint32_t level=uint32_t((uint64_t(brightness)*display13AuxMax+32767)/65535);
++    if(brightness && !level)level=1;
++    uint8_t buf[2] {};uint32_t len=1;
++    if(display13AuxWide){buf[0]=uint8_t(level>>8);buf[1]=uint8_t(level);len=2;} else buf[0]=uint8_t(level);
++    const auto r=wr(port,0x722,buf,len);
++    if(!r && display13AuxEnable && !display13AuxEnabled) {
++        uint8_t ctl=0;
++        if(!rd(port,0x720,&ctl,1)) {
++            if(!(ctl&1)){ctl|=1;wr(port,0x720,&ctl,1);}
++            display13AuxEnabled=true;
++        }
++    }
++    if(display13AuxCalls++<8)SYSLOG("igfx","Display13 AUX backlight brightness=%u level=%u/%u rc=%x",brightness,level,display13AuxMax,r);
++    return !r;
++}
++
++static __attribute__((noinline)) uint64_t display13PixelClockHz(uint64_t adjusted,uint32_t htotal,IOMemoryMap *map) {
++    if(adjusted>=20000000ULL && adjusted<=2000000000ULL)return adjusted;
++    uint64_t hz=0;uint32_t live=0;
++    if(map && map->getVirtualAddress() && map->getLength()==0x1000000)
++        live=*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+0x45270)&0x1FF;
++    if(live && htotal && htotal<=16384)hz=(uint64_t(htotal)*16000000ULL)/(2ULL*live-1ULL);
++    SYSLOG("igfx","Display13 pixel clock fallback adjusted=%llx htotal=%u live=%u -> %llu Hz",adjusted,htotal,live,hz);
++    return hz;
++}
++
+ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
+ 	auto &c=display13FBPower;if(!c.lock)return;
+ 	uint64_t record[32] {},inputs[24] {};IOLockLock(c.lock);
+@@ -9383,7 +9491,7 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
+ 			// Audited native pixel/scaling calculation is CPU-only. Preserve its
+ 			// path frequency and downscale behavior rather than assuming FHD Hz.
+ 			auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
+-			const auto pixel=adjust(c.controller,fb,path,cursor,nullptr);
++			const auto pixel=display13PixelClockHz(adjust(c.controller,fb,path,cursor,nullptr),htotal,c.map);
+ 			p=Display13WM::plan(width,htotal,pixel,range.end-range.start,c.latency,(ipc&8) || Display13FBMemory::field<uint8_t>(c.controller,0x1B4C),yTiled,cursor ? width : ((Display13FBMemory::field<uint32_t>(plane,0x11C)>>16)&0x1FFF)+1);
+ 			if(p.status==Display13WM::Status::Complete) {
+ 				auto object=reinterpret_cast<uint8_t *>(plane);
+@@ -9433,6 +9541,62 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
+ void XE::wrapAlderLakeNPlaneWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,false);}
+ void XE::wrapDisplay13CursorWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,true);}
+ 
++// The donor can hand pipe WM setup a pending CRTC whose PIPESRC is set but whose
++// transcoder timing words (HTOTAL..VSYNC, words 4..9) were never filled (seen on
++// the LG gram OLED eDP: HTOTAL 0x00470047 while PIPESRC 3200x2000). The native
++// driver programs this record, so repair it from the live firmware timing only
++// when the pending size equals the current size and the current timing is coherent.
++static __attribute__((noinline)) bool display13RepairPendingTiming(void *params,const void *path) {
++    if(!params || !path)return false;
++    auto p=static_cast<uint32_t *>(params);
++    auto cur=reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(path)+0x128);
++    const uint32_t src=p[10];const uint32_t w=(src>>16)+1,h=(src&0xFFFF)+1;
++    auto act=[](uint32_t v){return (v&0x3FFF)+1;};auto tot=[](uint32_t v){return ((v>>16)&0x3FFF)+1;};
++    if(src!=cur[10] || (act(p[4])==w && tot(p[4])>w && act(p[7])==h && tot(p[7])>h))return false;
++    if(act(cur[4])!=w || tot(cur[4])<=w || act(cur[7])!=h || tot(cur[7])<=h)return false;
++    uint32_t old[6];for(unsigned i=0;i<6;++i){old[i]=p[4+i];p[4+i]=cur[4+i];}
++    SYSLOG("igfx","Display13 pending CRTC repaired %ux%u htotal %08x->%08x vtotal %08x->%08x hsync %08x->%08x vsync %08x->%08x",
++        w,h,old[0],p[4],old[3],p[7],old[2],p[6],old[5],p[9]);
++    return true;
++}
++
++// On the LG gram OLED eDP path the donor's adjust-pixel-clock routine at the
++// verified offset hands back a pointer into the pending CRTC record instead of a
++// Hz value, so the line time computes to zero and the pipe is refused (black
++// screen with a live accelerator). Recover: dereference a pointer-looking result
++// inside the record; failing that, adopt the firmware's PIPE_WM_LINETIME for the
++// boot pipe, valid because the pending timing equals the running GOP timing.
++static __attribute__((noinline)) uint32_t display13LineTimeFallback(uint32_t htotal,uint64_t pixel,void *params,IOMemoryMap *map) {
++    uint64_t alt=0;uint32_t v=0,live=0;const auto base=reinterpret_cast<uintptr_t>(params);
++    if(params && pixel>=base && pixel+8<=base+0x1000) {
++        alt=*reinterpret_cast<const uint64_t *>(static_cast<uintptr_t>(pixel));
++        v=Display13WM::pipeLineTime(htotal,alt);
++        if(!v)v=Display13WM::pipeLineTime(htotal,alt&0xFFFFFFFFULL);
++        if(!v)v=Display13WM::pipeLineTime(htotal,(alt&0xFFFFFFFFULL)*1000ULL);
++    }
++    if(!v && map && map->getVirtualAddress() && map->getLength()==0x1000000) {
++        live=*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+0x45270)&0x1FF;
++        if(live)v=live;
++    }
++    SYSLOG("igfx","Display13 line time fallback htotal=%u pixel=%llx deref=%llx live=%u -> %u",htotal,pixel,alt,live,v);
++    return v;
++}
++
++// Diagnostic: dump the pending CRTC passed to pipe WM setup next to the path's
++// current CRTC (path+0x128), as 32-bit words. CPU-only, no MMIO.
++static __attribute__((noinline)) void display13WMDiag(const void *params,const void *path,uint64_t pixel) {
++    auto dump=[](const char *tag,const uint8_t *b) {
++        if(!b){SYSLOG("igfx","WMdiag %s null",tag);return;}
++        for(unsigned o=0;o<0x90;o+=0x20) {
++            const uint32_t *w=reinterpret_cast<const uint32_t *>(b+o);
++            SYSLOG("igfx","WMdiag %s +%02x: %08x %08x %08x %08x %08x %08x %08x %08x",tag,o,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]);
++        }
++    };
++    SYSLOG("igfx","WMdiag params=%p pathcrtc=%p pixel=%llx",params,path?static_cast<const uint8_t *>(path)+0x128:nullptr,pixel);
++    dump("params",static_cast<const uint8_t *>(params));
++    dump("path+128",path?static_cast<const uint8_t *>(path)+0x128:nullptr);
++}
++
+ void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject *path,void *params) {
+ 	auto &c=display13FBPower;if(!c.lock)return;
+ 	uint64_t record[8] {};IOLockLock(c.lock);
+@@ -9454,12 +9618,14 @@ void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject
+ 		// true excludes the primary plane's extra downscale multiplier, as in
+ 		// the original pipe calculation (distinct from plane WM computation).
+ 		auto crtc=params ? params : reinterpret_cast<uint8_t *>(path)+0x128;
++		if(params)display13RepairPendingTiming(params,path);
+ 		const auto htotal=((Display13FBMemory::field<uint32_t>(crtc,0x10)>>16)&0x3FFF)+1;
+ 		auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
+-		const auto pixel=adjust(controller,fb,path,true,crtc);
+-		const auto value=Display13WM::pipeLineTime(htotal,pixel);
++		const auto pixel=display13PixelClockHz(adjust(controller,fb,path,true,crtc),htotal,c.map);
++		auto value=Display13WM::pipeLineTime(htotal,pixel);
++		if(!value)value=display13LineTimeFallback(htotal,pixel,params,c.map);
+ 		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(crtc)+0x84)=value;
+-		if(!value)adlnFault(c.watermarkFaulted,__LINE__);
++		if(!value){display13WMDiag(params,path,pixel);adlnFault(c.watermarkFaulted,__LINE__);}
+ 		record[1]=value;record[2]=htotal;record[3]=pixel;record[4]=params!=nullptr;
+ 	} else adlnFault(c.watermarkFaulted,__LINE__);
+ 	record[0]=2;record[5]=valid;record[6]=reinterpret_cast<uintptr_t>(path);
+@@ -9666,7 +9832,7 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
+ 		void delayUs(unsigned us) {IOSleep(us/1000);}
+ 	} io {c.map};
+ 	auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
+-	const auto pipePixel=adjust(c.controller,fb,path,true,nullptr);
++	const auto pipePixel=display13PixelClockHz(adjust(c.controller,fb,path,true,nullptr),(Display13FBMemory::field<uint16_t>(path,0x13A)&0x3FFF)+1,c.map);
+     const auto primaryRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].primary);
+     const auto cursorRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].cursor);
+     if(primaryRaw==UINT32_MAX || cursorRaw==UINT32_MAX) {result.status=Display13WM::Status::Input;return result;}
+@@ -13254,6 +13420,12 @@ void XE::display13PanelTiming(void *controller,bool apply) {
+  IOLockUnlock(c.lock);
+ }
+ uint32_t XE::display13PanelBrightness(void *controller,uint32_t brightness) {
++ if(callbackXE->firmwarePorts.panel.auxBacklight) {
++  if(display13AuxBacklightSet(brightness)) {
++   *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;return 0;
++  }
++  if(display13AuxCalls++<8)SYSLOG("igfx","Display13 AUX backlight unavailable brightness=%u port=%llx",brightness,reinterpret_cast<uint64_t>(display13AuxPort));
++ }
+  if(!display13PanelCapture(controller))return kIOReturnNotReady;
+  auto &c=display13FBPower;IOLockLock(c.lock);Display13FBPanelIO io{c.map};bool ok=false;uint32_t duty=0;
+  if(display13PanelTarget(controller) && c.panel.pwm.duty(brightness,duty) &&
+@@ -13393,6 +13565,36 @@ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_
+     // ADLS_PANEL_PWM_INSTALL_END
+    }
+ 
++   if(display13FramebufferRequested) {
++    const char *timings="__ZN31AppleIntelFramebufferController12SetupTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2P10CRTCParams";
++    const uint8_t timingsEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
++    const auto timingsFn=patcher.solveSymbol(index,timings,address,size);
++    bool routed=false;
++    if(timingsFn && !memcmp(reinterpret_cast<void *>(timingsFn),timingsEntry,sizeof(timingsEntry))) {
++     KernelPatcher::RouteRequest route {timings,wrapDisplay13SetupTimings,orgDisplay13SetupTimings};
++     routed=patcher.routeMultiple(index,&route,1,address,size);
++    }
++    SYSLOG("igfx","Display13 SetupTimings refresh guard fn=%llx routed=%d",static_cast<uint64_t>(timingsFn),routed);
++    patcher.clearError();
++    {
++     const char *setup="__ZN21AppleIntelFramebuffer18setupDisplayTimingEPK29IODetailedTimingInformationV2PS0_";
++     const uint8_t setupEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x81,0xec,0xb0,0x00,0x00,0x00};
++     const auto setupFn=patcher.solveSymbol(index,setup,address,size);
++     bool setupRouted=false;
++     if(setupFn && !memcmp(reinterpret_cast<void *>(setupFn),setupEntry,sizeof(setupEntry))) {
++      KernelPatcher::RouteRequest route {setup,wrapDisplay13SetupDisplayTiming,orgDisplay13SetupDisplayTiming};
++      setupRouted=patcher.routeMultiple(index,&route,1,address,size);
++     }
++     SYSLOG("igfx","Display13 setupDisplayTiming prefill fn=%llx routed=%d",static_cast<uint64_t>(setupFn),setupRouted);
++     patcher.clearError();
++    }
++    if(firmwarePorts.panel.auxBacklight) {
++     display13ReadAUXFn=patcher.solveSymbol(index,"__ZN14AppleIntelPort7readAUXEjPvj",address,size);patcher.clearError();
++     display13WriteAUXFn=patcher.solveSymbol(index,"__ZN14AppleIntelPort8writeAUXEjPvj",address,size);patcher.clearError();
++     SYSLOG("igfx","Display13 AUX backlight read=%llx write=%llx",static_cast<uint64_t>(display13ReadAUXFn),static_cast<uint64_t>(display13WriteAUXFn));
++    }
++   }
++
+ 			if (tglActive) {
+ 				// TGL/Xe-LP has no dedicated eDP transcoder. Keep the allocated
+ 				// pipe (or getTranscoderOffset's pipe argument), including when
+@@ -13547,6 +13749,146 @@ bool XE::adlsCapturePanelPWM(void *controller) {
+  }
+  f.putPG(power,1);return s->adlsPanelPWM.valid();
+ }
++// Donor SetupTimings stores fb+0x4258 = timing.pixelClock/(htotal*vtotal)+1 and
++// hwWaitForVBlank, TimeCriticalDelayTillVBL, PerformFlipTransaction etc. divide by
++// 1000/refresh. A refresh above 1000 makes the per-line delay 0 and the next
++// divl traps (WindowServer setCursorImage -> hwWaitForVBlank). When the stored
++// value is not a plausible panel rate, derive it from the live pipe line time.
++// fb's own display path, as hwWaitForVBlank selects it: fb+0x3FD8 != -1 ? fb+0x4A08 : fb+0x49F0.
++static __attribute__((noinline)) const uint8_t *display13FbPath(const void *fb) {
++    if(!fb)return nullptr;
++    const auto f=static_cast<const uint8_t *>(fb);
++    const auto sel=*reinterpret_cast<const int32_t *>(f+0x3FD8);
++    const auto own=*reinterpret_cast<const uint8_t * const *>(f+(sel!=-1 ? 0x4A08 : 0x49F0));
++    return reinterpret_cast<uintptr_t>(own)>=0xFFFFFF8000000000ULL && !(reinterpret_cast<uintptr_t>(own)&7) ? own : nullptr;
++}
++// own+0x3648 is the AppleIntelPort; port+0x548 -> +8 == 0 marks eDP (hwWaitForVBlank).
++static __attribute__((noinline)) void display13CapturePort(const uint8_t *own) {
++    if(!own)return;
++    const auto port=*reinterpret_cast<uint8_t * const *>(own+0x3648);
++    if(reinterpret_cast<uintptr_t>(port)<0xFFFFFF8000000000ULL || (reinterpret_cast<uintptr_t>(port)&7))return;
++    const auto desc=*reinterpret_cast<const uint8_t * const *>(port+0x548);
++    if(reinterpret_cast<uintptr_t>(desc)>=0xFFFFFF8000000000ULL && !*reinterpret_cast<const uint32_t *>(desc+8) &&
++       display13AuxPort!=port) {
++        display13AuxPort=port;
++        SYSLOG("igfx","Display13 AUX backlight port captured %llx",reinterpret_cast<uint64_t>(port));
++    }
++}
++// Rewrite a requested timing with the live transcoder timing when the active size
++// matches, so the donor reprograms exactly what the firmware left running (120 Hz).
++// Pixel clock = DP symbol clock (DPCD LINK_BW_SET / LINK_RATE_SET) * LINK_M1 / LINK_N1.
++static uint64_t display13LivePixelHz {};
++static uint32_t display13LivePixelKey {};
++static __attribute__((noinline)) bool display13LiveTiming(const void *fb,uint8_t *out) {
++    const auto own=display13FbPath(fb);
++    if(!own || !out)return false;
++    display13CapturePort(own);
++    const auto pipe=*reinterpret_cast<const uint32_t *>(own+0x3640);
++    const auto map=display13FBPower.map;
++    if(pipe>3 || !map || !map->getVirtualAddress() || map->getLength()!=0x1000000)return false;
++    const auto mmio=map->getVirtualAddress();
++    auto rr=[&](uint32_t reg){return *reinterpret_cast<volatile uint32_t *>(mmio+reg);};
++    const uint32_t base=0x60000+pipe*0x1000;
++    const uint32_t ht=rr(base),hs=rr(base+8),vt=rr(base+0xC),vs=rr(base+0x14);
++    const uint64_t m=rr(base+0x40)&0xFFFFFF,n=rr(base+0x44)&0xFFFFFF;
++    const uint32_t hact=(ht&0x3FFF)+1,htot=((ht>>16)&0x3FFF)+1,hss=(hs&0x3FFF)+1,hse=((hs>>16)&0x3FFF)+1;
++    const uint32_t vact=(vt&0x3FFF)+1,vtot=((vt>>16)&0x3FFF)+1,vss=(vs&0x3FFF)+1,vse=((vs>>16)&0x3FFF)+1;
++    auto field=[&](size_t o)->uint32_t &{return *reinterpret_cast<uint32_t *>(out+o);};
++    if(field(0x40)!=hact || field(0x50)!=vact || !m || !n || htot<=hss || hss<hact || hse<hss ||
++       vtot<=vss || vss<vact || vse<vss)return false;
++    // DPCD LINK_BW_SET is unusable on this eDP 1.4 rate-table panel (reads 0x01, and the
++    // donor also derives a 27 MHz symbol clock from it). Pick the standard DP symbol clock
++    // whose rate*M/N best matches the live PIPE_WM_LINETIME estimate (1/8 us, rounded up:
++    // <=3% error; neighbouring rates differ by >=11%). The first good value is cached: the
++    // donor rewrites LINK_M/N from its own (wrong) link rate after the first mode set.
++    const uint32_t key=(htot<<16)|vtot;
++    uint64_t pixel=0;
++    if(display13LivePixelKey==key && display13LivePixelHz)pixel=display13LivePixelHz;
++    else {
++        const uint64_t line=rr(0x45270+pipe*4)&0x1FF;
++        if(!line)return false;
++        const uint64_t estimate=uint64_t(htot)*16000000ULL/(2*line-1);
++        static const uint64_t rates[]={162000000,216000000,243000000,270000000,324000000,432000000,540000000,810000000};
++        uint64_t best=0,bestError=~0ULL;
++        for(const auto r:rates) {
++            const uint64_t candidate=r*m/n,error=candidate>estimate?candidate-estimate:estimate-candidate;
++            if(error<bestError){bestError=error;best=candidate;}
++        }
++        if(!best || bestError*25>estimate)return false; // > 4 %
++        pixel=best;display13LivePixelHz=pixel;display13LivePixelKey=key;
++        SYSLOG("igfx","Display13 live pixel clock m=%llu n=%llu line=%llu estimate=%llu -> %llu",m,n,line,estimate,pixel);
++    }
++    if(pixel<20000000ULL || pixel>2000000000ULL)return false;
++    field(0x44)=htot-hact;field(0x48)=hss-hact;field(0x4C)=hse-hss;
++    field(0x54)=vtot-vact;field(0x58)=vss-vact;field(0x5C)=vse-vss;
++    *reinterpret_cast<uint64_t *>(out+0x28)=pixel;
++    *reinterpret_cast<uint64_t *>(out+0x30)=pixel;
++    *reinterpret_cast<uint64_t *>(out+0x38)=pixel;
++    return true;
++}
++static uint32_t display13TimingCalls {};
++static __attribute__((noinline)) void display13LogTiming(const char *tag,const void *timing) {
++    if(!timing)return;
++    const auto t=static_cast<const uint8_t *>(timing);
++    auto f=[&](size_t o){return *reinterpret_cast<const uint32_t *>(t+o);};
++    SYSLOG("igfx","Display13 %s pixel=%llu h=%u+%u(%u,%u) v=%u+%u(%u,%u) sig=%x enc=%x bpc=%x colorimetry=%x range=%x",tag,
++        *reinterpret_cast<const uint64_t *>(t+0x28),f(0x40),f(0x44),f(0x48),f(0x4C),f(0x50),f(0x54),f(0x58),f(0x5C),f(0x20),
++        *reinterpret_cast<const uint16_t *>(t+0x88),*reinterpret_cast<const uint16_t *>(t+0x8A),
++        *reinterpret_cast<const uint16_t *>(t+0x8C),*reinterpret_cast<const uint16_t *>(t+0x8E));
++}
++
++uint64_t XE::wrapDisplay13SetupDisplayTiming(void *fb,const void *in,void *out) {
++    // The donor returns without touching *out when kAGDCRegisterLinkModesetCallback
++    // fails; hwSetMode then consumes uninitialised stack (pixel clock, size, bpc).
++    if(in && out)memcpy(out,in,0xA0);
++    const auto result=FunctionCast(wrapDisplay13SetupDisplayTiming,callbackXE->orgDisplay13SetupDisplayTiming)(fb,in,out);
++    const bool live=out && display13LiveTiming(fb,static_cast<uint8_t *>(out));
++    if(display13TimingCalls++<6) {
++        display13LogTiming("setupDisplayTiming in",in);
++        display13LogTiming(live?"setupDisplayTiming out(live)":"setupDisplayTiming out",out);
++        SYSLOG("igfx","Display13 setupDisplayTiming result=%llx live=%d",result,live);
++    }
++    return result;
++}
++
++static __attribute__((noinline)) void display13GuardRefresh(void *fb,void *path,const void *timing) {
++    if(!fb || !timing)return;
++    const auto t=static_cast<const uint8_t *>(timing);
++    const uint64_t pixel=*reinterpret_cast<const uint64_t *>(t+0x28);
++    const uint32_t ha=*reinterpret_cast<const uint32_t *>(t+0x40),hb=*reinterpret_cast<const uint32_t *>(t+0x44);
++    const uint32_t va=*reinterpret_cast<const uint32_t *>(t+0x50),vb=*reinterpret_cast<const uint32_t *>(t+0x54);
++    auto &refresh=*reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(fb)+0x4258);
++    const uint32_t before=refresh;
++    if(before>=2 && before<=500) {
++        SYSLOG("igfx","Display13 refresh ok=%u pixel=%llu h=%u+%u v=%u+%u",before,pixel,ha,hb,va,vb);
++        return;
++    }
++    // The donor drops SetupTimings' unused path argument at its call sites, so
++    // the incoming path register is garbage. Use the fb's own display path the
++    // way hwWaitForVBlank does: fb+0x3FD8 != -1 ? fb+0x4A08 : fb+0x49F0.
++    (void)path;uint32_t pipe=0;
++    if(const auto own=display13FbPath(fb)) {
++        const auto p=*reinterpret_cast<const uint32_t *>(own+0x3640);if(p<4)pipe=p;
++        display13CapturePort(own);
++    }
++    uint32_t live=0;auto map=display13FBPower.map;
++    if(map && map->getVirtualAddress() && map->getLength()==0x1000000)
++        live=*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+0x45270+pipe*4)&0x1FF;
++    uint32_t vtotal=va+vb;if(vtotal<200 || vtotal>8192)vtotal=0;
++    uint32_t fixed=0;
++    if(live && vtotal)fixed=uint32_t(8000000ULL/(uint64_t(live)*vtotal))+1;
++    if(fixed<2 || fixed>500)fixed=61;
++    refresh=fixed;
++    SYSLOG("igfx","Display13 refresh guard before=%u pixel=%llu h=%u+%u v=%u+%u pipe=%u live=%u -> %u",
++        before,pixel,ha,hb,va,vb,pipe,live,fixed);
++}
++
++uint64_t XE::wrapDisplay13SetupTimings(void *controller,void *fb,void *path,const void *timing,void *params) {
++    const auto result=FunctionCast(wrapDisplay13SetupTimings,callbackXE->orgDisplay13SetupTimings)(controller,fb,path,timing,params);
++    display13GuardRefresh(fb,path,timing);
++    return result;
++}
++
+ uint32_t XE::wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void *timing) {
+  auto s=callbackXE;
+  if(s->display13FramebufferRequested && s->adlnOutputWiring.panel && !display13PanelCapture(controller))return kIOReturnNotReady;
+@@ -14421,6 +14763,13 @@ bool XE::wrapTGLAcceleratorRegister(IOService *that) {
+   controller ? Display13FBMemory::field<uint32_t>(controller,0xDF8) : 0,display13FBGTT.initialized,display13FBGTT.faulted,display13FBPower.memoryFaulted};
+  IORegistryEntry::getRegistryRoot()->setProperty("N97SharedRegisterCheck",before,sizeof(before));
+  IORegistryEntry::getRegistryRoot()->setProperty("N97SharedRegisterPrerequisites",ready);
++	 {
++	  auto cp=controller ? controller->getProvider() : nullptr;auto ap=that->getProvider();
++	  SYSLOG("igfx","N97 shared register ready=%u ctrl=%p(%s) ctrlProv=%p(%s) accel=%p accelProv=%p(%s) owner=%p",
++	   ready,controller,controller ? controller->getMetaClass()->getClassName() : "-",
++	   cp,cp ? cp->getMetaClass()->getClassName() : "-",that,ap,ap ? ap->getMetaClass()->getClassName() : "-",
++	   static_cast<IOService *>(adlnSharedOwner));
++	 }
+ 	 if(!ready)return false;
+ 	 __atomic_store_n(&adlnSharedOwner,that,__ATOMIC_RELEASE);
+ 	}
+diff --git a/WhateverXe/kern_xe.hpp b/WhateverXe/kern_xe.hpp
+index b35a3d4..361e124 100644
+--- a/WhateverXe/kern_xe.hpp
++++ b/WhateverXe/kern_xe.hpp
+@@ -109,6 +109,9 @@ private:
+     bool adlsPLLTableReady {},adlsClockReady {},adlsPowerReady {},adlsPanelPWMReady {};
+  XELP::PanelPWM adlsPanelPWM;
+  mach_vm_address_t orgADLSLightUpEDP {},orgADLSPanelBacklight {};
++ mach_vm_address_t orgDisplay13SetupTimings {},orgDisplay13SetupDisplayTiming {};
++ static uint64_t wrapDisplay13SetupDisplayTiming(void *fb,const void *in,void *out);
++ static uint64_t wrapDisplay13SetupTimings(void *controller,void *fb,void *path,const void *timing,void *params);
+  static bool adlsPanelPWMTarget(void *controller,void *&access,void *&power);
+  static bool adlsCapturePanelPWM(void *controller);
+  static uint32_t wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void *timing);
+@@ -216,6 +219,8 @@ private:
+  static bool display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller);
+ 
+  static uint8_t *display13SSTPort(void *port);
++ static void display13SSTDiag(OSObject *port,bool dp);
++ static void display13AdoptEDPPortMode(OSObject *port,uint32_t ddi);
+  static bool display13HDMIPort(void *port);
+  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
+  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
+diff --git a/WhateverXe/kern_xelp_panel_power.hpp b/WhateverXe/kern_xelp_panel_power.hpp
+index 3c014ca..8779276 100644
+--- a/WhateverXe/kern_xelp_panel_power.hpp
++++ b/WhateverXe/kern_xelp_panel_power.hpp
+@@ -1,63 +1,64 @@
+-// Panel sequencing facts and a bounded bridge to the exact donor's PPS fields.
+-// Units/layout checked against Linux v6.12 intel_bios.h/intel_pps.c. No Linux
+-// implementation is included. Native PPS sequencing remains the single owner.
+-#ifndef KERN_XELP_PANEL_POWER_HPP
+-#define KERN_XELP_PANEL_POWER_HPP
+-#include "kern_vbt.hpp"
+-namespace XELP {
+-struct PanelPower {
+- // The current donor has one panel and addresses PPS/PWM controller 0.
+- // This qualification does not claim PPS1, AUX backlight or panel admission
+- // outside the native Combo panel coordinates; each needs its own adapter.
+- static bool nativePPS0(const VBT::Ports &v,Family family) {
+-  const auto &p=v.panel;
+-  const auto adapter=displayAdapter(family);
+-  const bool backend=(adapter==DisplayAdapter::TGL && p.ddi<2) ||
+-                     (adapter==DisplayAdapter::ADLS && p.ddi==0) ||
+-                     ((adapter==DisplayAdapter::ADLP || adapter==DisplayAdapter::ADLN) && p.ddi<2);
+-  if(!backend || !v.valid() || v.unmapped || !p.valid ||
+-     !p.backlightValid || !p.pwmPresent || p.backlightType!=2 || p.controller)return false;
+-  const auto &port=v.port[p.ddi];const auto aux=p.ddi?0x10U:0x40U;
+-  if(!(v.present&(1U<<p.ddi)) || !port.internal() || !port.dp() ||
+-     (port.type&(0x400|0x20|1)) || (port.flags&0x17) || (port.capabilities&3) ||
+-     VBT::ddi(family,port.dvo)!=p.ddi || port.aux!=aux)return false;
+-  for(unsigned d=0;d<PortCount;++d)if(d!=p.ddi && (v.present&(1U<<d)) &&
+-     v.port[d].dp() && v.port[d].aux==aux)return false;
+-  return true;
+- }
+- struct Plan {
+-  // Donor +1548: T8, T9, T1+T3, T10 (100us), cycle (100ms encoding).
+-  uint32_t fields[5] {};
+-  bool valid {};
+- };
+- static Plan select(const VBT::Ports::Panel &panel,const uint32_t native[5],
+-                    uint32_t on,uint32_t off,uint32_t control) {
+-  Plan p;
+-  if(!panel.valid || !native || on==~0U || off==~0U || control==~0U)return p;
+-  // Reject overflow before the donor masks silently shorten a delay. Merge
+-  // each explicit native property, even if its T8 property is absent.
+-  for(unsigned i=0;i<4;++i)if(native[i]>0x1fff)return p;
+-  if(native[4]>31)return p;
+-  const uint32_t bios[]={on>>16&0x1fff,on&0x1fff,off&0x1fff,off>>16&0x1fff,(control>>4&31)*1000};
+-  const uint32_t defaults[]={2100,500,500,5000,6100};
+-  const unsigned index[]={2,0,1,3,4};
+-  bool any=false;for(auto v:panel.delays)any|=v!=0;
+-  for(unsigned i=0;i<5;++i) {
+-   uint32_t v=panel.delays[i];
+-   // Linux adjusts VBT T12 once, before merging; never add to a BIOS readback.
+-   if(i==4 && any)v+=1000;
+-   if(v<bios[i])v=bios[i];
+-   const auto n=native[index[i]]*(i==4?1000U:1U);
+-   if(v<n)v=n;
+-   if(!v)v=defaults[i];
+-   if(i==4)v=(v+999)/1000;
+-   if(v>(i==4?31U:0x1fffU))return {};
+-   p.fields[index[i]]=v;
+-  }
+-  // Unlike i915, the donor owns the hardware backlight waits. Keep T8/T9;
+-  // do not copy i915's value 1, which relies on separate software sleeps.
+-  p.valid=true;return p;
+- }
+-};
+-}
+-#endif
++// Panel sequencing facts and a bounded bridge to the exact donor's PPS fields.
++// Units/layout checked against Linux v6.12 intel_bios.h/intel_pps.c. No Linux
++// implementation is included. Native PPS sequencing remains the single owner.
++#ifndef KERN_XELP_PANEL_POWER_HPP
++#define KERN_XELP_PANEL_POWER_HPP
++#include "kern_vbt.hpp"
++namespace XELP {
++struct PanelPower {
++ // The current donor has one panel and addresses PPS/PWM controller 0.
++ // This qualification does not claim PPS1, AUX backlight or panel admission
++ // outside the native Combo panel coordinates; each needs its own adapter.
++ static bool nativePPS0(const VBT::Ports &v,Family family) {
++  const auto &p=v.panel;
++  const auto adapter=displayAdapter(family);
++  const bool backend=(adapter==DisplayAdapter::TGL && p.ddi<2) ||
++                     (adapter==DisplayAdapter::ADLS && p.ddi==0) ||
++                     ((adapter==DisplayAdapter::ADLP || adapter==DisplayAdapter::ADLN) && p.ddi<2);
++  if(!backend || !v.valid() || v.unmapped || !p.valid ||
++     !p.backlightValid || !p.pwmPresent || p.controller ||
++     (p.backlightType!=2 && !(p.backlightType==5 && p.auxBacklight)))return false;
++  const auto &port=v.port[p.ddi];const auto aux=p.ddi?0x10U:0x40U;
++  if(!(v.present&(1U<<p.ddi)) || !port.internal() || !port.dp() ||
++     (port.type&(0x400|0x20|1)) || (port.flags&0x17) || (port.capabilities&3) ||
++     VBT::ddi(family,port.dvo)!=p.ddi || port.aux!=aux)return false;
++  for(unsigned d=0;d<PortCount;++d)if(d!=p.ddi && (v.present&(1U<<d)) &&
++     v.port[d].dp() && v.port[d].aux==aux)return false;
++  return true;
++ }
++ struct Plan {
++  // Donor +1548: T8, T9, T1+T3, T10 (100us), cycle (100ms encoding).
++  uint32_t fields[5] {};
++  bool valid {};
++ };
++ static Plan select(const VBT::Ports::Panel &panel,const uint32_t native[5],
++                    uint32_t on,uint32_t off,uint32_t control) {
++  Plan p;
++  if(!panel.valid || !native || on==~0U || off==~0U || control==~0U)return p;
++  // Reject overflow before the donor masks silently shorten a delay. Merge
++  // each explicit native property, even if its T8 property is absent.
++  for(unsigned i=0;i<4;++i)if(native[i]>0x1fff)return p;
++  if(native[4]>31)return p;
++  const uint32_t bios[]={on>>16&0x1fff,on&0x1fff,off&0x1fff,off>>16&0x1fff,(control>>4&31)*1000};
++  const uint32_t defaults[]={2100,500,500,5000,6100};
++  const unsigned index[]={2,0,1,3,4};
++  bool any=false;for(auto v:panel.delays)any|=v!=0;
++  for(unsigned i=0;i<5;++i) {
++   uint32_t v=panel.delays[i];
++   // Linux adjusts VBT T12 once, before merging; never add to a BIOS readback.
++   if(i==4 && any)v+=1000;
++   if(v<bios[i])v=bios[i];
++   const auto n=native[index[i]]*(i==4?1000U:1U);
++   if(v<n)v=n;
++   if(!v)v=defaults[i];
++   if(i==4)v=(v+999)/1000;
++   if(v>(i==4?31U:0x1fffU))return {};
++   p.fields[index[i]]=v;
++  }
++  // Unlike i915, the donor owns the hardware backlight waits. Keep T8/T9;
++  // do not copy i915's value 1, which relies on separate software sleeps.
++  p.valid=true;return p;
++ }
++};
++}
++#endif

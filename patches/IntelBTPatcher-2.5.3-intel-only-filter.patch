@@ -1,0 +1,27 @@
+--- a/IntelBTPatcher.cpp	2026-11-08 03:02:27.835607600 +0800
++++ b/IntelBTPatcher.cpp	2026-11-08 03:02:27.867303000 +0800
+@@ -201,8 +201,24 @@
+ #define HCI_OP_LE_READ_REMOTE_FEATURES  0x2016
+ 
+ int remoteReadSCount = 0;
++// Local change: only inspect control requests sent to an Intel Bluetooth controller
++// (idVendor 0x8087, bDeviceClass 0xE0). Every other USB device (e.g. UVCAssistant's
++// camera requests, whose descriptors are not wired) is passed through untouched.
++static bool ibtpIsIntelBluetooth(void *that)
++{
++    auto entry = OSDynamicCast(IORegistryEntry, reinterpret_cast<OSObject *>(that));
++    if (entry == nullptr)
++        return false;
++    auto vendor = OSDynamicCast(OSNumber, entry->getProperty("idVendor"));
++    auto cls = OSDynamicCast(OSNumber, entry->getProperty("bDeviceClass"));
++    return vendor != nullptr && vendor->unsigned32BitValue() == 0x8087 &&
++           cls != nullptr && cls->unsigned32BitValue() == 0xE0;
++}
++
+ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
+ {
++    if (!ibtpIsIntelBluetooth(that))
++        return FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
+     HciCommandHdr *hdr = nullptr;
+     uint32_t hdrLen = 0;
+     char hciBuf[MAX_HCI_BUF_LEN] = {0};
