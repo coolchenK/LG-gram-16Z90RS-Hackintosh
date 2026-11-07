@@ -70,8 +70,9 @@ LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）�
 | NVMe 硬盘 | ✅ | NVMeFix |
 | 电池 | ✅ | ECEnabler + SMCBatteryManager |
 | 环境光传感器 | ❌ | 本机没有对应硬件（无 ACPI0008 / ISH） |
-| 摄像头 | ❔ | 未测试 |
-| USB / HDMI / USB-C 视频输出 | ❔ | 未做 USB 端口映射，外接显示未测试 |
+| 摄像头 | ✅ | |
+| USB | ✅ | 没做 USB 端口映射，但实测可用 |
+| HDMI / USB-C 视频输出 | ❔ | 未测试 |
 | 指纹 | ❌ | 黑苹果普遍不支持 |
 
 ## 安装步骤
@@ -319,12 +320,13 @@ OpenCore 1.0.8 EFI for the **LG gram Style 16 (16Z90RS, i5-1340P, Iris Xe A7A0, 
 - Display off/on, which needs the Apple TGL framebuffer boot-args `-nodisplaysleepDC6 -nopsr`; without them waking the display ends in a display-interrupt storm and a hard freeze
 - I2C touchpad (VoodooI2C CI + a VoodooI2CHID patch that writes the PTP Selective Reporting feature with its full 2-byte payload)
 - Speakers (`tools/audio` initialises the 4 smart amps), Wi-Fi (AirportItlwm), Bluetooth (lshbluesky IntelBluetoothFirmware 2.5.3 + an Intel-only IntelBTPatcher filter), NVMe and battery
+- Camera and USB
 
 **Not working**:
 - S3 sleep: the firmware is Modern-Standby only, so resume becomes a cold boot
 - Hibernation: the image is never written, even with HibernationFixup
 - Internal DMIC, LG WMI Fn keys other than brightness, Wi-Fi 7 MLO / WPA3-only networks
 
-**Untested**: headphone jack, camera, external displays.
+**Untested**: headphone jack, external displays.
 
 Install the EFI next to Windows' boot files in the ESP, add a firmware entry with `bcdedit`, install WhateverXe Graphics, run `sudo tools/install.sh`, and disable sleep with `pmset` (see step 6).
