@@ -1,0 +1,504 @@
+--- a/WhateverXe/kern_start.cpp	2026-11-09 01:51:07
++++ b/WhateverXe/kern_start.cpp	2026-11-09 02:44:13
+@@ -9,6 +9,7 @@
+ #include <Headers/kern_api.hpp>
+ 
+ #include "kern_host.hpp"
++#include "kern_hdr_fix2.hpp"
+ 
+ static XeHost host;
+ 
+@@ -38,6 +39,7 @@
+ 	KernelVersion::Tahoe,
+ 	[]() {
+ 		host.init();
++		XeHDRFix::init();
+ 	}
+ };
+ 
+--- a/WhateverXe/kern_hdr_fix2.hpp	1970-01-01 08:00:00
++++ b/WhateverXe/kern_hdr_fix2.hpp	2026-11-09 02:55:13
+@@ -0,0 +1,32 @@
++// Runtime-validated CoreDisplay generation compatibility. BSD-3-Clause.
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include "kern_hdr_inspect.hpp"
++namespace XeHDRFix {
++using XeHDRInspect::Status;
++// Bits 0-3 are the deferred descriptor symbols; bits 8-17 are the runtime
++// helpers resolved after qualification. No other bits may be required.
++constexpr uint32_t RequiredResolvedMask=(0xFU)|(0x3FFU<<8);
++constexpr char Query[]="machdep.cpu.leaf7_features";
++constexpr uint8_t CallerTail[]={0x48,0x89,0xc7,0xbe,0x53,0,0,0,0xe8,0x9a,0xa8,4,0,0x48,0x85,0xc0,0x74,0x24,0x0f,0xb7,8,0x81,0xf1,0x53,0x47,0,0,0x0f,0xb6,0x50,2,0x83,0xf2,0x58,0x66,9,0xca,0x74,0x12};
++constexpr uint8_t CallerHead[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x81,0xec,0x30,2,0,0};
++inline bool userAddress(uint64_t p,size_t n){return p>=0x1000&&p<0x0000800000000000ULL&&n<=0x0000800000000000ULL-p;}
++inline bool sharedCode(uint64_t p){return p>=0x00007ff000000000ULL&&p<0x0000800000000000ULL-512;}
++inline bool frameBound(uint64_t rsp,uint64_t rbp,uint64_t old,uint64_t oldlenp){return !(rsp&7)&&!(rbp&7)&&userAddress(rsp,65536)&&rbp>=rsp+0x238&&rbp<=rsp+65536-16&&old==rbp-0x230&&oldlenp==rbp-0x238;}
++constexpr size_t NoWord=static_cast<size_t>(-1);
++inline size_t compatWord(const char *s,size_t n,size_t capacity){
++ if(!s||n<5||n>capacity||s[n-1])return NoWord;
++ for(size_t i=0;i+1<n;++i)if(!s[i])return NoWord;
++ for(size_t i=0;i+3<n;++i)if(!memcmp(s+i,"SGX",3))return NoWord;
++ size_t found=NoWord;
++ for(size_t i=0;i+4<n;++i)if((!i||s[i-1]==' ')&&!memcmp(s+i,"AVX2",4)&&(s[i+4]==' '||!s[i+4])){if(found!=NoWord)return NoWord;found=i;}
++ return found;
++}
++constexpr uint32_t CompatibilityWord=0x20584753U;
++inline bool eligible(bool requested,bool normal,uint32_t major,uint32_t minor,bool kernelIdentity,uint32_t identity,uint32_t revision,uint32_t ebx){
++ return requested&&normal&&major==24&&minor==6&&kernelIdentity&&identity==0xA7A08086U&&revision==4&&(ebx&(1U<<5))&&!(ebx&(1U<<2));
++}
++void init();
++}
+--- a/WhateverXe/kern_hdr_fix2.cpp	1970-01-01 08:00:00
++++ b/WhateverXe/kern_hdr_fix2.cpp	2026-11-09 02:55:13
+@@ -0,0 +1,125 @@
++// Runtime-validated RPL-P CoreDisplay generation query. BSD-3-Clause.
++#include "kern_hdr_fix2.hpp"
++#include "kern_hdr_native_attrs.hpp"
++#include <Headers/kern_api.hpp>
++#include <Headers/kern_devinfo.hpp>
++#include <Headers/kern_iokit.hpp>
++#include <IOKit/pci/IOPCIDevice.h>
++#include <kern/thread.h>
++#include <mach/i386/thread_status.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <libkern/c++/OSSerialize.h>
++#include "kern_xelp_device.hpp"
++
++namespace XeHDRFix { namespace {
++static_assert(sizeof(sysctl_req)==80&&offsetof(sysctl_req,oldptr)==16&&offsetof(sysctl_req,oldidx)==32&&offsetof(sysctl_req,newptr)==48,"24H232 sysctl request ABI");
++static_assert(sizeof(sysctl_oid)==80&&offsetof(sysctl_oid,oid_name)==40&&offsetof(sysctl_oid,oid_handler)==48,"24H232 sysctl descriptor ABI");
++static_assert(x86_THREAD_STATE64_COUNT==42,"saved x86-64 state ABI");
++using Handler=int(*)(sysctl_oid*,void*,int,sysctl_req*);
++mach_vm_address_t original;
++const char *expectedName;sysctl_oid_list *expectedParent;
++kern_return_t(*getState)(thread_t,int,thread_state_t,mach_msg_type_number_t*);
++const char *(*identityOf)(void*);int(*platformOf)(void*);int(*validOf)(void*);
++void *(*executableVnode)(void*);int(*getPath)(void*,char*,int*);int(*putVnode)(void*);
++void *(*vfsContext)();int(*vnodeAttrs)(void*,void*,void*);int(*atomicOut32)(uint32_t,uint64_t);
++bool requested,adaptEnabled,normal,qualified,installed,pointVerified;
++uint32_t identity,revision,features,kernelMatched,installError,buildStatus,osVersionState,resolvedMask,descriptorMismatch,routeQueries;
++volatile uint32_t leafQueries,wsQueries,probeQueries,matched,adapted,stateError,copyError;
++bool serialize(void*,void*,OSSerialize *s){
++ uint32_t v[]={6,requested,adaptEnabled,normal,qualified,__atomic_load_n(&installed,__ATOMIC_ACQUIRE),identity,revision,features,kernelMatched,pointVerified,installError,
++  __atomic_load_n(&leafQueries,__ATOMIC_RELAXED),__atomic_load_n(&wsQueries,__ATOMIC_RELAXED),__atomic_load_n(&probeQueries,__ATOMIC_RELAXED),__atomic_load_n(&matched,__ATOMIC_RELAXED),__atomic_load_n(&adapted,__ATOMIC_RELAXED),__atomic_load_n(&stateError,__ATOMIC_RELAXED),__atomic_load_n(&copyError,__ATOMIC_RELAXED),
++  buildStatus,osVersionState,resolvedMask,descriptorMismatch,routeQueries};
++ auto d=OSData::withBytes(v,sizeof(v));if(!d)return false;const bool ok=d->serialize(s);d->release();return ok;
++}
++bool publish(){auto root=IORegistryEntry::getRegistryRoot();if(!root)return false;auto s=OSSerializer::forTarget(nullptr,serialize);if(!s)return false;const bool ok=root->setProperty("WEXHDRCPUQuery",s);s->release();return ok;}
++__attribute__((noinline)) unsigned scope(void *p){
++ const char *id=identityOf(p);if(!id||!validOf(p))return 0;
++ if(!strcmp(id,"com.apple.WindowServer")&&platformOf(p))return 1;
++ if(strcmp(id,"org.coolchenk.wex-hdr-probe")||kauth_cred_getuid(kauth_cred_get())!=0)return 0;
++ auto vp=executableVnode(p);if(!vp)return 0;char path[256]{};int n=sizeof(path);XeHDRNativeABI::VnodeAttributes attrs;attrs.prepareUidMode();
++ const int pe=getPath(vp,path,&n),ae=vnodeAttrs(vp,attrs.data(),vfsContext());putVnode(vp);
++ uint32_t uid=~0U;uint16_t mode=0;
++ if(pe||ae||!attrs.uidMode(uid,mode)||uid||(mode&0022))return 0;
++ return !strcmp(path,"/Library/PrivilegedHelperTools/com.coolchenk.wex-hdr-probe")||!strcmp(path,"/System/Volumes/Data/Library/PrivilegedHelperTools/com.coolchenk.wex-hdr-probe")?2:0;
++}
++__attribute__((noinline)) bool callerAt(uint64_t ret,uint64_t frame,uint64_t rsp,uint64_t output){
++ if(!sharedCode(ret)||!frameBound(rsp,frame,output,frame-0x238))return false;
++ uint8_t head[sizeof(CallerHead)]{},tail[sizeof(CallerTail)]{},lea[7]{},call[5]{};
++ if(copyin(ret-86,head,sizeof(head))||memcmp(head,CallerHead,sizeof(head))||copyin(ret+129,tail,sizeof(tail))||memcmp(tail,CallerTail,sizeof(tail)))return false;
++ if(copyin(ret-20,lea,sizeof(lea))||lea[0]!=0x48||lea[1]!=0x8d||lea[2]!=0x3d||copyin(ret-5,call,sizeof(call))||call[0]!=0xe8)return false;
++ int32_t displacement=0;memcpy(&displacement,lea+3,4);const uint64_t literal=ret-13+static_cast<int64_t>(displacement);if(!sharedCode(literal))return false;
++ char text[sizeof(Query)]{};uint64_t capacity=0;
++ return !copyin(literal,text,sizeof(text))&&!memcmp(text,Query,sizeof(text))&&!copyin(frame-0x238,&capacity,8)&&capacity==512;
++}
++__attribute__((noinline)) bool fromGenerationQuery(uint64_t output){
++ natural_t state[x86_THREAD_STATE64_COUNT]{};mach_msg_type_number_t n=x86_THREAD_STATE64_COUNT;const auto kr=getState(current_thread(),x86_THREAD_STATE64,reinterpret_cast<thread_state_t>(state),&n);
++ if(kr||n!=x86_THREAD_STATE64_COUNT){__atomic_store_n(&stateError,kr?static_cast<uint32_t>(kr):0xffffffffU,__ATOMIC_RELAXED);return false;}
++ uint64_t rbp=0,rsp=0;memcpy(&rbp,reinterpret_cast<uint8_t*>(state)+48,8);memcpy(&rsp,reinterpret_cast<uint8_t*>(state)+56,8);
++ if((rsp&7)||!userAddress(rsp,65536))return false;const auto end=rsp+65536;
++ uint64_t top=0;if(!copyin(rsp,&top,8)&&callerAt(top,rbp,rsp,output))return true;
++ for(unsigned i=0;i<8;++i){if((rbp&7)||rbp<rsp||rbp>end-16)break;uint64_t f[2]{};if(copyin(rbp,f,sizeof(f)))break;if((f[0]&7)||f[0]<=rbp||f[0]>end-16)break;if(callerAt(f[1],f[0],rsp,output))return true;rbp=f[0];}
++ return false;
++}
++__attribute__((noinline)) int candidate(sysctl_oid *oid,void *a1,int a2,sysctl_req *r,unsigned kind){
++ const bool caller=fromGenerationQuery(r->oldptr);if(kind==1)__sync_fetch_and_add(&wsQueries,1);else __sync_fetch_and_add(&probeQueries,1);
++ const int result=reinterpret_cast<Handler>(original)(oid,a1,a2,r);if(result||!caller)return result;__sync_fetch_and_add(&matched,1);
++ if(!adaptEnabled)return result;
++ const size_t actual=r->oldidx;char data[512]{};if(!actual||actual>sizeof(data)||copyin(r->oldptr,data,actual)){__sync_fetch_and_add(&copyError,1);return result;}
++ const auto off=compatWord(data,actual,sizeof(data));if(off==NoWord)return result;const auto dst=r->oldptr+off;
++ if((dst&3)||!userAddress(dst,4)||scope(r->p)!=kind||!fromGenerationQuery(r->oldptr))return result;
++ const int err=atomicOut32(CompatibilityWord,dst);if(err){__sync_fetch_and_add(&copyError,1);return err;}__sync_fetch_and_add(&adapted,1);return result;
++}
++int wrap(sysctl_oid *oid,void *a1,int a2,sysctl_req *r){
++ if(!__atomic_load_n(&installed,__ATOMIC_ACQUIRE)||!qualified||!oid||oid->oid_name!=expectedName||oid->oid_parent!=expectedParent||!r||!r->p||r->p!=current_proc()||r->newptr||r->newlen||r->oldlen!=512||r->oldidx||!userAddress(r->oldptr,512))
++  return reinterpret_cast<Handler>(original)(oid,a1,a2,r);
++ __sync_fetch_and_add(&leafQueries,1);const auto k=scope(r->p);return k?candidate(oid,a1,a2,r,k):reinterpret_cast<Handler>(original)(oid,a1,a2,r);
++}
++bool copyStatic(void *opaque,uint64_t source,void *destination,size_t size){
++ auto copy=reinterpret_cast<uintptr_t(*)(uintptr_t,uintptr_t,uintptr_t)>(opaque);
++ if(!copy||!destination||size>XeHDRInspect::HeaderBudget)return false;
++ return copy(static_cast<uintptr_t>(source),reinterpret_cast<uintptr_t>(destination),size)==size;
++}
++void kernelReady(void*,KernelPatcher &p){
++ if(__atomic_load_n(&installed,__ATOMIC_ACQUIRE))return;
++ if(!publish())return;
++ auto info=DeviceInfo::create();if(info){auto gpu=OSDynamicCast(IOPCIDevice,info->videoBuiltin);if(gpu&&WIOKit::awaitPublishing(gpu)){auto q=XELP::deviceProfile(gpu);identity=q.identity;revision=q.revision;}DeviceInfo::deleter(info);}
++ uint32_t a=7,b=0,c=0,d=0;__asm__ volatile("cpuid":"+a"(a),"=b"(b),"+c"(c),"+d"(d));features=b;
++ auto nofault=p.solveSymbol(KernelPatcher::KernelID,"_ml_nofault_copy");p.clearError();
++ auto version=reinterpret_cast<const char*>(p.solveSymbol(KernelPatcher::KernelID,"_version"));p.clearError();
++ auto header=reinterpret_cast<const uint8_t*>(p.solveSymbol(KernelPatcher::KernelID,"__mh_execute_header"));p.clearError();
++ auto anchor=p.solveSymbol(KernelPatcher::KernelID,"_sysctl__machdep_children");p.clearError();
++ resolvedMask=(nofault?1U:0U)|(version?2U:0U)|(header?4U:0U)|(anchor?8U:0U);
++ auto os=reinterpret_cast<const char*>(p.solveSymbol(KernelPatcher::KernelID,"_osversion"));p.clearError();
++ osVersionState=!os?0:!os[0]?1:!strncmp(os,"24H232",7)?2:3;
++ XeHDRInspect::Snapshot snapshot{};
++ if(resolvedMask==15){
++  auto scratch=static_cast<uint8_t*>(IOMalloc(XeHDRInspect::HeaderBudget));
++  if(scratch){XeHDRInspect::Symbols syms{reinterpret_cast<uint64_t>(header),reinterpret_cast<uint64_t>(version),anchor};XeHDRInspect::inspect(copyStatic,reinterpret_cast<void*>(nofault),syms,scratch,XeHDRInspect::HeaderBudget,snapshot);IOFree(scratch,XeHDRInspect::HeaderBudget);}
++ }
++ buildStatus=static_cast<uint32_t>(snapshot.status);kernelMatched=(snapshot.status==XeHDRInspect::Status::Ready);
++ pointVerified=(snapshot.status==XeHDRInspect::Status::Ready);
++ qualified=eligible(requested,normal,getKernelVersion(),static_cast<uint32_t>(getKernelMinorVersion()),kernelMatched==1,identity,revision,features);
++ if(!qualified){installError=1;return;}
++ #define RESOLVE(dst,symbol,bit) dst=reinterpret_cast<decltype(dst)>(p.solveSymbol(KernelPatcher::KernelID,symbol));p.clearError();if(dst)resolvedMask|=1U<<bit
++ RESOLVE(getState,"_machine_thread_get_state",8);RESOLVE(identityOf,"_csproc_get_identity",9);RESOLVE(platformOf,"_csproc_get_platform_binary",10);RESOLVE(validOf,"_cs_valid",11);
++ RESOLVE(executableVnode,"_proc_getexecutablevnode",12);RESOLVE(getPath,"_vn_getpath",13);RESOLVE(putVnode,"_vnode_put",14);RESOLVE(vfsContext,"_vfs_context_current",15);
++ RESOLVE(vnodeAttrs,"_vnode_getattr",16);RESOLVE(atomicOut32,"_copyout_atomic32",17);
++ #undef RESOLVE
++ if(resolvedMask!=RequiredResolvedMask){installError=2;return;}
++ expectedName=reinterpret_cast<const char*>(snapshot.name);expectedParent=reinterpret_cast<sysctl_oid_list*>(snapshot.parent);
++ descriptorMismatch=(snapshot.kind!=0x80e00003U?1U:0U)|(snapshot.parent!=anchor+8?2U:0U);
++ KernelPatcher::RouteRequest route{nullptr,wrap,original};route.from=snapshot.handler;
++ const bool ready=p.routeMultiple(KernelPatcher::KernelID,&route,1);p.clearError();__atomic_store_n(&installed,ready,__ATOMIC_RELEASE);installError=ready?0:4;routeQueries=snapshot.readCalls;
++}
++}
++void init(){
++ requested=checkKernelArgument("-wex-hdrleaf2");adaptEnabled=checkKernelArgument("-wex-hdradapt");
++ normal=lilu.getRunMode()==LiluAPI::RunningNormal;
++ if(!requested||!normal||getKernelVersion()!=KernelVersion::Sequoia||getKernelMinorVersion()!=6)return;
++ lilu.onPatcherLoad(kernelReady,nullptr);
++}
++}
+--- a/WhateverXe/kern_hdr_inspect.hpp	1970-01-01 08:00:00
++++ b/WhateverXe/kern_hdr_inspect.hpp	2026-11-09 02:44:13
+@@ -0,0 +1,165 @@
++// Read-only validation of the native leaf descriptor. BSD-3-Clause.
++// No routing, user-memory operations, or implicit reads through kernel pointers.
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++namespace XeHDRInspect {
++constexpr size_t HeaderBudget = 8192;
++constexpr char ExpectedVersion[] = "Darwin Kernel Version 24.6.0: Sun Oct 11 23:36:58 PDT 2026; root:xnu-11417.140.69.713.47~2/RELEASE_X86_64";
++constexpr uint8_t ExpectedUUID[16] = {0x74,0x79,0x34,0xe9,0xfd,0x01,0x36,0xab,0x8e,0x97,0x06,0xa5,0x78,0xab,0x22,0xf9};
++constexpr uint8_t ExpectedHead[16] = {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x48,0x81,0xec,0x08,0x02,0,0};
++constexpr char ExpectedName[] = "leaf7_features";
++constexpr char ExpectedFormat[] = "A";
++
++enum class Status : uint32_t {
++    Ready = 0, MissingSymbol, HeaderRead, HeaderFormat, UUIDMismatch,
++    LayoutInvalid, VersionRange, VersionRead, VersionMismatch,
++    DescriptorRange, DescriptorRead, DescriptorFields,
++    NameRange, NameRead, NameMismatch, FormatRange, FormatRead, FormatMismatch,
++    HandlerRange, HandlerRead, HandlerMismatch
++};
++struct Symbols { uint64_t header, version, anchor; };
++struct Range {
++    uint64_t start {}, size {};
++    bool contains(uint64_t address, size_t length) const {
++        return size && length && address >= start && address - start <= size &&
++            length <= size - (address - start);
++    }
++};
++struct Layout { Range text, constants, strings, descriptors; uint64_t slide {}; };
++struct Snapshot {
++    uint32_t schema {1};
++    Status status {Status::MissingSymbol};
++    uint32_t readCalls {}, kind {};
++    uint64_t header {}, version {}, anchor {}, descriptor {}, parent {}, name {}, handler {}, format {};
++    Layout layout {};
++};
++using Reader = bool (*)(void *, uint64_t, void *, size_t);
++inline uint32_t u32(const uint8_t *p) { uint32_t v; memcpy(&v,p,4); return v; }
++inline uint64_t u64(const uint8_t *p) { uint64_t v; memcpy(&v,p,8); return v; }
++inline bool add(uint64_t base, uint64_t offset, uint64_t &result) {
++    if (offset > UINT64_MAX - base) return false;
++    result = base + offset; return true;
++}
++inline bool kernelRange(uint64_t address, size_t length) {
++    constexpr uint64_t end = 0xfffffffffffff000ULL;
++    return length && address >= 0xffffff8000000000ULL && address < end && length <= end - address;
++}
++inline bool fixedName(const uint8_t *p, const char *expected) {
++    const size_t n = strlen(expected);
++    return n < 16 && !memcmp(p, expected, n) && p[n] == 0;
++}
++inline bool read(Reader reader, void *context, Snapshot &s, uint64_t address, void *out, size_t length) {
++    if (!reader || !out || length > HeaderBudget || !kernelRange(address,length)) return false;
++    ++s.readCalls;
++    return reader(context,address,out,length);
++}
++inline bool shifted(Range &r, uint64_t slide) {
++    uint64_t start;
++    if (!r.size || r.size > SIZE_MAX || !add(r.start,slide,start) || !kernelRange(start,static_cast<size_t>(r.size))) return false;
++    r.start = start; return true;
++}
++
++// scratch is owned writable memory. Every external byte enters through Reader.
++inline Status inspect(Reader reader, void *context, const Symbols &symbols,
++                      uint8_t *scratch, size_t capacity, Snapshot &s) {
++    s = Snapshot {};
++    s.header=symbols.header; s.version=symbols.version; s.anchor=symbols.anchor;
++    const auto fail = [&](Status status) { s.status=status; return status; };
++    if (!symbols.header || !symbols.version || !symbols.anchor || !scratch || capacity < HeaderBudget)
++        return fail(Status::MissingSymbol);
++    if (!read(reader,context,s,symbols.header,scratch,32)) return fail(Status::HeaderRead);
++    if (u32(scratch)!=0xfeedfacfU || u32(scratch+4)!=0x01000007U || u32(scratch+12)!=2)
++        return fail(Status::HeaderFormat);
++    const uint32_t count=u32(scratch+16), bytes=u32(scratch+20);
++    if (!count || count>128 || bytes<24 || bytes>HeaderBudget-32 || count>bytes/8)
++        return fail(Status::HeaderFormat);
++    const size_t end=32+bytes;
++    // Re-read the complete bounded snapshot, then verify its header stayed fixed.
++    uint8_t initial[32]; memcpy(initial,scratch,sizeof(initial));
++    if (!read(reader,context,s,symbols.header,scratch,end)) return fail(Status::HeaderRead);
++    if (memcmp(initial,scratch,sizeof(initial))) return fail(Status::HeaderFormat);
++    size_t off=32; bool haveUUID=false, haveText=false;
++    uint64_t textBase=0;
++    for (uint32_t i=0;i<count;++i) {
++        if (off>end || end-off<8) return fail(Status::HeaderFormat);
++        const uint32_t command=u32(scratch+off), length=u32(scratch+off+4);
++        if (length<8 || (length&7) || length>end-off) return fail(Status::HeaderFormat);
++        const uint8_t *p=scratch+off;
++        if (command==0x1b) {
++            if (haveUUID || length!=24) return fail(Status::HeaderFormat);
++            if (memcmp(p+8,ExpectedUUID,sizeof(ExpectedUUID))) return fail(Status::UUIDMismatch);
++            haveUUID=true;
++        } else if (command==0x19) {
++            if (length<72) return fail(Status::HeaderFormat);
++            const uint32_t sections=u32(p+64), protections=u32(p+60);
++            if (sections>(length-72)/80 || 72+static_cast<size_t>(sections)*80!=length)
++                return fail(Status::HeaderFormat);
++            const uint64_t segmentBase=u64(p+24), segmentSize=u64(p+32);
++            if (fixedName(p+8,"__TEXT")) {
++                if (haveText || !(protections&1) || segmentSize<end) return fail(Status::LayoutInvalid);
++                haveText=true; textBase=segmentBase;
++            }
++            for (uint32_t n=0;n<sections;++n) {
++                const uint8_t *section=p+72+n*80;
++                const uint64_t address=u64(section+32), size=u64(section+40);
++                Range *target=nullptr;
++                if (fixedName(p+8,"__TEXT") && fixedName(section+16,"__TEXT")) {
++                    if (fixedName(section,"__text") && (protections&5)==5) target=&s.layout.text;
++                    else if (fixedName(section,"__const") && (protections&1)) target=&s.layout.constants;
++                    else if (fixedName(section,"__cstring") && (protections&1)) target=&s.layout.strings;
++                } else if (fixedName(p+8,"__DATA_CONST") && fixedName(section+16,"__DATA_CONST") &&
++                           fixedName(section,"__const") && (protections&1)) target=&s.layout.descriptors;
++                if (target) {
++                    // Only these mapped sections supply read addresses. File-only
++                    // debug metadata (for example __CTF) may have no VM extent.
++                    if (target->size || !size || address<segmentBase || address-segmentBase>segmentSize ||
++                        size>segmentSize-(address-segmentBase)) return fail(Status::LayoutInvalid);
++                    *target=Range{address,size};
++                }
++            }
++        }
++        off+=length;
++    }
++    if (off!=end) return fail(Status::HeaderFormat);
++    if (!haveUUID) return fail(Status::UUIDMismatch);
++    if (!haveText || symbols.header<textBase) return fail(Status::LayoutInvalid);
++    s.layout.slide=symbols.header-textBase;
++    if (!shifted(s.layout.text,s.layout.slide) || !shifted(s.layout.constants,s.layout.slide) ||
++        !shifted(s.layout.strings,s.layout.slide) || !shifted(s.layout.descriptors,s.layout.slide))
++        return fail(Status::LayoutInvalid);
++
++    char version[sizeof(ExpectedVersion)] {};
++    if (!s.layout.constants.contains(symbols.version,sizeof(version))) return fail(Status::VersionRange);
++    if (!read(reader,context,s,symbols.version,version,sizeof(version))) return fail(Status::VersionRead);
++    if (memcmp(version,ExpectedVersion,sizeof(version))) return fail(Status::VersionMismatch);
++    uint64_t parent;
++    if (!add(symbols.anchor,0x560,s.descriptor) || !add(symbols.anchor,8,parent) ||
++        !s.layout.descriptors.contains(symbols.anchor,16) ||
++        !s.layout.descriptors.contains(s.descriptor,80)) return fail(Status::DescriptorRange);
++    uint8_t descriptor[80] {};
++    if (!read(reader,context,s,s.descriptor,descriptor,sizeof(descriptor))) return fail(Status::DescriptorRead);
++    s.parent=u64(descriptor); s.kind=u32(descriptor+20); s.name=u64(descriptor+40);
++    s.handler=u64(descriptor+48); s.format=u64(descriptor+56);
++    if (s.parent!=parent || s.kind!=0x80e00003U || u64(descriptor+24) || u32(descriptor+32))
++        return fail(Status::DescriptorFields);
++
++    // Each stage returns before any access through a rejected address.
++    char name[sizeof(ExpectedName)] {};
++    if (!s.layout.strings.contains(s.name,sizeof(name))) return fail(Status::NameRange);
++    if (!read(reader,context,s,s.name,name,sizeof(name))) return fail(Status::NameRead);
++    if (memcmp(name,ExpectedName,sizeof(name))) return fail(Status::NameMismatch);
++    char format[sizeof(ExpectedFormat)] {};
++    if (!s.layout.strings.contains(s.format,sizeof(format))) return fail(Status::FormatRange);
++    if (!read(reader,context,s,s.format,format,sizeof(format))) return fail(Status::FormatRead);
++    if (memcmp(format,ExpectedFormat,sizeof(format))) return fail(Status::FormatMismatch);
++    uint8_t head[sizeof(ExpectedHead)] {};
++    if (!s.layout.text.contains(s.handler,sizeof(head))) return fail(Status::HandlerRange);
++    if (!read(reader,context,s,s.handler,head,sizeof(head))) return fail(Status::HandlerRead);
++    if (memcmp(head,ExpectedHead,sizeof(head))) return fail(Status::HandlerMismatch);
++    return fail(Status::Ready);
++}
++void init();
++}
+--- a/WhateverXe/kern_hdr_inspect.cpp	1970-01-01 08:00:00
++++ b/WhateverXe/kern_hdr_inspect.cpp	2026-11-09 02:44:13
+@@ -0,0 +1,80 @@
++// Opt-in read-only inspection of a native kernel descriptor. BSD-3-Clause.
++#include "kern_hdr_inspect.hpp"
++#include <Headers/kern_api.hpp>
++#include <Headers/kern_devinfo.hpp>
++#include <Headers/kern_iokit.hpp>
++#include <IOKit/pci/IOPCIDevice.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include "kern_xelp_device.hpp"
++
++namespace XeHDRInspect { namespace {
++// XNU x86_64 private ABI, verified against this exact kernel image. Resolve by
++// name; never directly link an unsupported KPI or synthesize its address.
++using NoFaultCopy = uintptr_t (*)(uintptr_t, uintptr_t, uintptr_t);
++struct ReadContext { NoFaultCopy copy; };
++bool copyStatic(void *opaque, uint64_t source, void *destination, size_t size) {
++    auto context=static_cast<ReadContext *>(opaque);
++    if (!context || !context->copy || !destination || !kernelRange(source,size) || size>HeaderBudget)
++        return false;
++    // Only static kernel-image sources selected by inspect(), and our own
++    // wired heap/stack destination buffers. A short copy is always failure.
++    return context->copy(static_cast<uintptr_t>(source),reinterpret_cast<uintptr_t>(destination),size)==size;
++}
++void number(OSDictionary *d,const char *key,uint64_t value) {
++    auto v=OSNumber::withNumber(value,64);if(v){d->setObject(key,v);v->release();}
++}
++void address(OSDictionary *d,const char *key,uint64_t value) {
++    char text[19]{};snprintf(text,sizeof(text),"0x%016llx",static_cast<unsigned long long>(value));
++    auto v=OSString::withCString(text);if(v){d->setObject(key,v);v->release();}
++}
++void publish(OSDictionary *d,const Snapshot &s) {
++    number(d,"schema",s.schema);number(d,"status",static_cast<uint32_t>(s.status));
++    number(d,"ready",s.status==Status::Ready);number(d,"readCalls",s.readCalls);number(d,"kind",s.kind);
++    number(d,"routeInstalled",0);
++    address(d,"header",s.header);address(d,"version",s.version);address(d,"anchor",s.anchor);
++    address(d,"descriptor",s.descriptor);address(d,"parent",s.parent);address(d,"name",s.name);
++    address(d,"handler",s.handler);address(d,"format",s.format);address(d,"headerSlide",s.layout.slide);
++    address(d,"textStart",s.layout.text.start);number(d,"textSize",s.layout.text.size);
++    address(d,"constantsStart",s.layout.constants.start);number(d,"constantsSize",s.layout.constants.size);
++    address(d,"stringsStart",s.layout.strings.start);number(d,"stringsSize",s.layout.strings.size);
++    address(d,"descriptorsStart",s.layout.descriptors.start);number(d,"descriptorsSize",s.layout.descriptors.size);
++    if(auto root=IORegistryEntry::getRegistryRoot())root->setProperty("WEXHDRLeafInspect",d);
++}
++void kernelReady(void *,KernelPatcher &patcher) {
++    auto diagnostic=OSDictionary::withCapacity(32);if(!diagnostic)return;
++    Snapshot snapshot{};uint32_t identity=0,revision=0;
++    auto info=DeviceInfo::create();
++    if(info){
++        auto gpu=OSDynamicCast(IOPCIDevice,info->videoBuiltin);
++        if(gpu&&WIOKit::awaitPublishing(gpu)){auto p=XELP::deviceProfile(gpu);identity=p.identity;revision=p.revision;}
++        DeviceInfo::deleter(info);
++    }
++    const bool hardware=identity==0xA7A08086U&&revision==4;
++    number(diagnostic,"hardwareQualified",hardware);number(diagnostic,"identity",identity);number(diagnostic,"revision",revision);
++    uint32_t resolved=0;
++    if(hardware){
++        auto copy=reinterpret_cast<NoFaultCopy>(patcher.solveSymbol(KernelPatcher::KernelID,"_ml_nofault_copy"));patcher.clearError();
++        Symbols symbols{};
++        symbols.header=patcher.solveSymbol(KernelPatcher::KernelID,"__mh_execute_header");patcher.clearError();
++        symbols.version=patcher.solveSymbol(KernelPatcher::KernelID,"_version");patcher.clearError();
++        symbols.anchor=patcher.solveSymbol(KernelPatcher::KernelID,"_sysctl__machdep_children");patcher.clearError();
++        resolved=(copy?1U:0U)|(symbols.header?2U:0U)|(symbols.version?4U:0U)|(symbols.anchor?8U:0U);
++        snapshot.header=symbols.header;snapshot.version=symbols.version;snapshot.anchor=symbols.anchor;
++        if(resolved==15){
++            auto scratch=static_cast<uint8_t *>(IOMalloc(HeaderBudget));
++            if(scratch){ReadContext context{copy};inspect(copyStatic,&context,symbols,scratch,HeaderBudget,snapshot);IOFree(scratch,HeaderBudget);}
++            else number(diagnostic,"allocationFailed",1);
++        }
++    }
++    number(diagnostic,"resolvedMask",resolved);publish(diagnostic,snapshot);diagnostic->release();
++}
++}
++void init(){
++    if(!checkKernelArgument("-wex-hdrdiag")||lilu.getRunMode()!=LiluAPI::RunningNormal||
++       getKernelVersion()!=KernelVersion::Sequoia||getKernelMinorVersion()!=6)return;
++    lilu.onPatcherLoad(kernelReady,nullptr);
++}
++}
+--- a/WhateverXe/kern_hdr_native_attrs.hpp	1970-01-01 08:00:00
++++ b/WhateverXe/kern_hdr_native_attrs.hpp	2026-11-09 02:44:13
+@@ -0,0 +1,36 @@
++// Native 24H232 vnode_attr layout receipt. BSD-3-Clause.
++// Actual kernel CTF: struct vnode_attr, type2272, 53 members, size456.
++// This storage helper performs no filesystem call and must only be used after
++// the exact kernel image identity has been qualified by the caller.
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++namespace XeHDRNativeABI {
++class alignas(8) VnodeAttributes {
++    uint8_t storage[456] {};
++    static constexpr uint64_t Wanted=(1ULL<<7)|(1ULL<<9);
++public:
++    void prepareUidMode() {
++        memset(storage,0,sizeof(storage));
++        const uint64_t active=Wanted;
++        memcpy(storage+8,&active,sizeof(active));
++    }
++    void *data(){return storage;}
++    const void *data()const{return storage;}
++    static constexpr size_t size(){return 456;}
++    bool uidMode(uint32_t &uid,uint16_t &mode)const {
++        uint64_t supported=0;memcpy(&supported,storage,sizeof(supported));
++        if((supported&Wanted)!=Wanted)return false;
++        memcpy(&uid,storage+68,sizeof(uid));
++        memcpy(&mode,storage+76,sizeof(mode));
++        return true;
++    }
++    bool rootOwnedNotWritableByOthers()const {
++        uint32_t uid=~0U;uint16_t mode=0;
++        return uidMode(uid,mode)&&uid==0&&(mode&0022)==0;
++    }
++};
++static_assert(sizeof(VnodeAttributes)==456,"24H232 CTF vnode_attr size");
++static_assert(alignof(VnodeAttributes)==8,"24H232 CTF vnode_attr alignment");
++}
+--- a/tests/fixtures/boot_argument_names.json	2026-11-09 01:51:07
++++ b/tests/fixtures/boot_argument_names.json	2026-11-09 02:48:37
+@@ -149,5 +149,8 @@
+   "-wex-adlp-load-only": [],
+   "-wex-display13-offline": [],
+   "-wex-dsi-hdmi-test": [],
+-  "-wex-dsi-power-test": []
++  "-wex-dsi-power-test": [],
++  "-wex-hdrleaf2": [],
++  "-wex-hdradapt": [],
++  "-wex-hdrdiag": []
+ }
+--- a/tests/hdr_fix2_policy.cpp	1970-01-01 08:00:00
++++ b/tests/hdr_fix2_policy.cpp	2026-11-09 02:55:13
+@@ -0,0 +1,18 @@
++#include "kern_hdr_fix2.hpp"
++#include <cassert>
++#include <cstring>
++#include <cstdint>
++int main(){using namespace XeHDRFix;constexpr uint32_t avx=1U<<5,sgx=1U<<2,id=0xA7A08086;
++ static_assert(RequiredResolvedMask==0x3ff0fU,"resolved-mask must cover only the symbols the hook resolves");
++ assert((RequiredResolvedMask&0xFU)==0xFU&&(RequiredResolvedMask>>8)==0x3FFU);
++ assert(eligible(true,true,24,6,true,id,4,avx));assert(!eligible(false,true,24,6,true,id,4,avx));assert(!eligible(true,false,24,6,true,id,4,avx));
++ assert(!eligible(true,true,24,5,true,id,4,avx));assert(!eligible(true,true,24,6,false,id,4,avx));assert(!eligible(true,true,24,6,true,id+1,4,avx));
++ assert(!eligible(true,true,24,6,true,id,3,avx));assert(!eligible(true,true,24,6,true,id,4,0));assert(!eligible(true,true,24,6,true,id,4,avx|sgx));
++ assert(!userAddress(0,1)&&!userAddress(UINT64_MAX,8));assert(userAddress(0x7ffffffffff8ULL,8));assert(!sharedCode(0x100000000)&&sharedCode(0x7ff81497da5aULL));
++ constexpr uint64_t rsp=0x70000001000,rbp=rsp+0x300;assert(frameBound(rsp,rbp,rbp-0x230,rbp-0x238));assert(!frameBound(rsp,rbp,rbp-0x230+1,rbp-0x238));
++ char b[128]="RDWRFSGS TSC_THREAD_OFFSET BMI1 AVX2 FDPEO SMEP";char old[128];memcpy(old,b,128);const auto n=strlen(b)+1;auto off=compatWord(b,n,sizeof b);assert(off==32&&!(off&3));
++ memcpy(b+off,&CompatibilityWord,4);assert(strlen(b)+1==n&&strstr(b," SGX ")&&!strstr(b,"AVX2"));assert(compatWord(b,n,sizeof b)==NoWord);
++ const char *bad[]={"SGX AVX2","AVX2 AVX2","XAVX2","AVX20","BMI1"};for(auto s:bad)assert(compatWord(s,strlen(s)+1,128)==NoWord);
++ assert(compatWord("AVX2",5,5)==0);assert(compatWord("AVX2",5,4)==NoWord);assert(compatWord(nullptr,1,8)==NoWord);
++ assert(sizeof(XeHDRInspect::ExpectedHead)==16&&sizeof(CallerHead)==18&&sizeof(CallerTail)==39);
++}

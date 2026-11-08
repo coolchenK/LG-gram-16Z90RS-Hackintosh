@@ -918,7 +918,7 @@
 				AAAAAAAAAAAAAAAAAAA=
 				</data>
 				<key>boot-args</key>
-				<string>-allow3d -disablegfxfirmware -igfxdvmt -wex-auxbl revcpu=1 alcverbs=1 -btlfxallowanyaddr -vi2c-force-polling -nodisplaysleepDC6 -nopsr</string>
+				<string>-allow3d -disablegfxfirmware -igfxdvmt -wex-auxbl revcpu=1 alcverbs=1 -btlfxallowanyaddr -vi2c-force-polling -nodisplaysleepDC6 -nopsr -wex-hdrleaf2 -wex-hdradapt</string>
 				<key>csr-active-config</key>
 				<data>
 				AwgAAA==

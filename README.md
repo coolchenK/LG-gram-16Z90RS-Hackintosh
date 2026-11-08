@@ -4,7 +4,7 @@
 
 LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）运行 macOS Sequoia 15.8.2 的完整 EFI、补丁源码和安装后工具。
 
-核显加速、120 Hz OLED、亮度、扬声器、触控板、Wi-Fi、蓝牙都已可用；**整机睡眠和休眠不可用**（固件只支持现代待机），已配置为"合盖只关屏、系统不睡眠"。
+核显加速、120 Hz OLED、内屏 HDR（EDR）、亮度、扬声器、触控板、Wi-Fi、蓝牙都已可用；**整机睡眠和休眠不可用**（固件只支持现代待机），已配置为"合盖只关屏、系统不睡眠"。
 
 **本仓库的 EFI 已去除个人信息**：`PlatformInfo > Generic` 里的序列号、MLB、SystemUUID、ROM 都是占位值，使用前必须生成自己的（见[第 4 步](#4-生成-smbios)）。
 
@@ -55,7 +55,7 @@ LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）�
 | 内屏 120 Hz HiDPI | ✅ | 3200×2000，24 位色，无色带 |
 | 内屏亮度 | ✅ | DPCD AUX 背光（11 位）；Fn 亮度键可用；自动关屏再唤醒后仍可调（见“本仓库的修复补丁”） |
 | HEVC Main / Main10 硬解 | ✅ | VideoToolbox 强制硬解测试：720p、24 fps，各 96/96 帧，零解码错误；不代表所有直播/转换路径稳定 |
-| 内屏 HDR | ❌ | 面板原厂 EDID 声明 PQ/BT.2020，Windows 可开启；已恢复完整 EDID，但当前 macOS 未提供 HDR 模式，仍在排查 |
+| 内屏 HDR | ✅ | 通过修正 CoreDisplay 的 CPU 代数判断开放内屏 EDR：potential EDR 2.0；QuickTime 播放 PQ/BT.2020 10-bit HEVC 实测 current EDR 2.0。系统设置中没有内屏 HDR 开关是正常的（Apple 只为外接 HDR10 显示器提供该开关），内屏 HDR 走 EDR 路径 |
 | 自动关屏 / 锁屏后点亮 | ✅ | 需要 `-nodisplaysleepDC6 -nopsr`，否则点亮后整机冻结（见[补丁说明](#3-关屏再点亮整机冻结)） |
 | 合盖 | ✅ | 只关屏，系统继续运行（`pmset disablesleep 1`） |
 | 整机睡眠（S3） | ❌ | 固件按现代待机（S0ix）设计，S3 唤醒会冷启动，已禁用 |
@@ -232,12 +232,15 @@ macOS 下挂载 LG 恢复分区：`sudo mount -t msdos /dev/disk0s9 /tmp/lgefi`�
 5. **刷新率保护**：`SetupTimings` 在苹果驱动里拿到的是未初始化的时序，会除以 0，加了兜底。
 6. **时序补全**：`setupDisplayTiming` 在 AGDC 回调失败时不写输出，补成先复制输入、再用实际寄存器的值覆盖。顺带修好了色带问题。
 7. **背光写入**：通过 `AppleIntelPort::writeAUX` 写 DPCD `0x722/0x723`。面板在自动关屏（DPMS/doze）时会复位 DPCD 的亮度模式与使能位：原先只在首次调用时读取并缓存，唤醒后亮度写入会被面板接受但不生效。现在每次调亮度前都会重新读取 `0x720/0x721` 并恢复 AUX 模式/使能，再写亮度值（`patches/WhateverXe-0.8.0-aux-backlight-repaint.patch`）。
+8. **内屏 HDR（EDR）**：CoreDisplay 用 `machdep.cpu.leaf7_features` 里的 `SGX` 子串判断 CPU 是否 Skylake 及以后；Raptor Lake-P 没有 SGX，于是被误判为老平台，EDR 上限被压到 1.0。补丁在精确限定 WindowServer 的那次 CoreDisplay 查询后，把返回串里的 `AVX2` 改为等长 `SGX `，使内屏 EDR 上限恢复到 2.0（`patches/WhateverXe-0.8.0-hdr-core-generation.patch`，需要 `-wex-hdrleaf2 -wex-hdradapt`）。只在匹配的内核版本/UUID、硬件和 CoreDisplay 调用点上生效，普通 CPU 查询保持不变。
 
-编译方法：`git clone https://github.com/b00t0x/WhateverXe` → `git checkout 0.8.0`（`db438fdf4d5fe903f5dfbc65537ed3884e2ea980`）→ `git apply patches/WhateverXe-0.8.0-lg-gram-rplp-edp.patch` → `git apply patches/WhateverXe-0.8.0-aux-backlight-repaint.patch`（按顺序应用；第二个补丁修复关屏唤醒后的 AUX 背光重新接管）→ 按上游文档准备 MacKernelSDK 与 Lilu 1.7.2 开发头文件 → `python3 tools/build.py --release`。请将补丁路径替换为本仓库中的实际位置。配套安装 WhateverXe Graphics 0.4.1。
+编译方法：`git clone https://github.com/b00t0x/WhateverXe` → `git checkout 0.8.0`（`db438fdf4d5fe903f5dfbc65537ed3884e2ea980`）→ `git apply patches/WhateverXe-0.8.0-lg-gram-rplp-edp.patch` → `git apply patches/WhateverXe-0.8.0-aux-backlight-repaint.patch` → `git apply patches/WhateverXe-0.8.0-hdr-core-generation.patch`（按顺序应用；第二个修复关屏唤醒后的 AUX 背光，第三个开放内屏 EDR）→ 按上游文档准备 MacKernelSDK 与 Lilu 1.7.2 开发头文件 → `python3 tools/build.py --release`。请将补丁路径替换为本仓库中的实际位置。配套安装 WhateverXe Graphics 0.4.1，并在 `boot-args` 中保留 `-wex-auxbl -wex-hdrleaf2 -wex-hdradapt`。
 
-运行上游 CPU 测试前，再应用 `patches/WhateverXe-0.8.0-lg-tests.patch` 和 `patches/WhateverXe-0.8.0-aux-backlight-tests.patch`（只适配测试夹具，不改运行时代码），然后执行 `python3 tools/test.py`。当前 0.8.0 + LG 补丁组合在 macOS 上通过 **208/208** 项检查，覆盖新增 AUX 背光和时序回退逻辑。实机 HEVC/HDR 查询方法见 [诊断工具说明](tools/diagnostics/README.md)。
+运行上游 CPU 测试前，再应用 `patches/WhateverXe-0.8.0-lg-tests.patch` 和 `patches/WhateverXe-0.8.0-aux-backlight-tests.patch`（只适配测试夹具，不改运行时代码），然后执行 `python3 tools/test.py`。当前 0.8.0 + LG 补丁组合在 macOS 上通过 **209/209** 项检查，覆盖新增 AUX 背光、内屏 HDR 查询和时序回退逻辑。实机 HEVC/HDR 查询方法见 [诊断工具说明](tools/diagnostics/README.md)。
 
 AUX 背光补丁的实机验证：同一台机器在 15 分钟自动关屏并唤醒后，修复前亮度调节失效，修复后亮度调节正常；两次 HEVC Main/Main10 强制硬解均为 96/96 帧、零错误。
+
+内屏 HDR 补丁的实机验证：修复前 `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue` 一直为 1.0；修复后为 2.0，用 QuickTime 播放 PQ/BT.2020、10-bit HEVC 测试片段时实时 `maximumExtendedDynamicRangeColorComponentValue` 达到 2.0。系统设置中没有内屏 HDR 开关属于正常现象（该开关只面向外接 HDR10 显示器）。普通 `sysctl machdep.cpu.leaf7_features` 仍显示 AVX2、不含 SGX，未做全局 CPU 特性伪造。
 
 ### 2. 触控板开机后不响应（`patches/VoodooI2CHID-*.patch`）
 
@@ -280,7 +283,7 @@ ALC298 后面接了 4 颗智能功放（`0x38/0x39/0x3c/0x3d`），需要按 Lin
 ### 已知问题
 
 - **图形/视频稳定性**：0.8.0 在本机 Sequoia 上已启用挂死恢复钩子，但不保证所有故障都能恢复。HEVC Main/Main10 的强制硬解短样片测试通过；IPTV 播放仍出现过 GPU 挂起和 WindowServer watchdog 五国。不能由“支持硬解”推导所有播放器稳定。
-- **HDR**：完整原厂 EDID 已恢复，面板声明 HDR10/PQ；当前 macOS 的 HDR 模式支持与 EDR 余量仍未开放。此项尚未修复。
+- **HDR**：已通过修正 CoreDisplay 的 CPU 代数判断开放内屏 EDR（potential/current EDR 2.0，QuickTime 播放 PQ/BT.2020 10-bit HEVC 实测 current EDR 2.0）。系统设置没有内屏 HDR 开关属正常（仅外接 HDR10 显示器有）。Safari 的 YouTube 4K/HDR 仍不可用：本机 WebKit 不支持 YouTube 使用的 VP9/AV1（`(dynamic-range: high)` 已匹配，属编解码器限制而非 EDR 问题）；请用 QuickTime 或 HEVC HDR 片源验证。
 
 - **整机睡眠（S3）**：FADT 里开着 `LOW_POWER_S0_IDLE_CAPABLE`，DSDT 的 `_S3` 只有在 `If (SS3)` 时才定义。macOS 进 S3 后唤醒会卡在固件阶段（`Sleep Wake failure in EFI 0x22 0x1f`），然后冷启动。
 - **休眠**：
@@ -330,9 +333,10 @@ OpenCore 1.0.8 EFI for the **LG gram Style 16 (16Z90RS, i5-1340P, Iris Xe A7A0, 
 - Camera and USB
 - Hardware HEVC Main/Main10 decoding: forced-hardware VideoToolbox tests decoded 96/96 frames for each 720p24 sample, with zero decode errors. This is not a long-duration or all-player stability guarantee.
 - The full 256-byte factory EDID is retained, including the original DisplayID 2.0 timings and HDR metadata; no HDR capabilities are invented.
+- Internal-panel HDR (EDR): the CoreDisplay CPU-generation check is corrected for this non-SGX Raptor Lake-P, raising `maximumPotentialExtendedDynamicRangeColorComponentValue` from 1.0 to 2.0. QuickTime playback of a PQ/BT.2020 10-bit HEVC clip measured a live `maximumExtendedDynamicRangeColorComponentValue` of 2.0. macOS offers no HDR toggle for built-in panels (that switch is only for external HDR10 displays); internal HDR is EDR-based. Requires `-wex-hdrleaf2 -wex-hdradapt`, and ordinary CPU feature queries are unchanged.
 
 **Not working / unresolved**:
-- HDR output is not enabled in macOS despite the panel's native PQ/BT.2020 declaration and working HDR in Windows.
+- Safari/YouTube 4K and HDR playback: this WebKit build supports HEVC/H.264 but not VP9/AV1, which YouTube uses for 4K and HDR streams. `(dynamic-range: high)` already matches in WebKit, so this is a codec limitation rather than an EDR one; use QuickTime or an HEVC HDR source to exercise the EDR path.
 - IPTV playback can still hang the GPU and lead to a WindowServer watchdog panic, even with the 0.8.0 recovery hook active.
 - S3 sleep: the firmware is Modern-Standby only, so resume becomes a cold boot
 - Hibernation: the image is never written, even with HibernationFixup
