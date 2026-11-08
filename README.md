@@ -336,6 +336,6 @@ OpenCore 1.0.8 EFI for the **LG gram Style 16 (16Z90RS, i5-1340P, Iris Xe A7A0, 
 - Hibernation: the image is never written, even with HibernationFixup
 - Internal DMIC, LG WMI Fn keys other than brightness, Wi-Fi 7 MLO / WPA3-only networks
 
-**Untested**: headphone jack, external displays.
+**Untested**: external displays.
 
 Install the EFI next to Windows' boot files in the ESP, add a firmware entry with `bcdedit`, install WhateverXe Graphics, run `sudo tools/install.sh`, and disable sleep with `pmset` (see step 6).
