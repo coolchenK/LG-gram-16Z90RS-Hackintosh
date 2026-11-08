@@ -65,7 +65,7 @@ LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）�
 | 扬声器 | ✅ | 需安装 `lggram-audiod`（初始化 4 颗功放、打开 0x17 引脚） |
 | 耳机孔 | ✅ | 正常 |
 | 内置麦克风 | ❌ | Intel SST 数字麦克风（PCH DMIC），macOS 不支持 |
-| Wi-Fi | ✅ | AirportItlwm（Sequoia alpha）；偶尔开机不自动连接，`wifikick` 会自动重连 |
+| Wi-Fi（2.4G/5G） | ✅ | AirportItlwm（Sequoia alpha）；偶尔开机不自动连接，`wifikick` 会自动重连 |
 | Wi-Fi 7 MLO / 仅 WPA3 网络 | ❌ | AirportItlwm 不支持 WPA3 |
 | 蓝牙 | ✅ | lshbluesky 分支 IntelBluetoothFirmware 2.5.3 + 本仓库补丁 |
 | NVMe 硬盘 | ✅ | NVMeFix |
