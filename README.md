@@ -283,7 +283,15 @@ ALC298 后面接了 4 颗智能功放（`0x38/0x39/0x3c/0x3d`），需要按 Lin
 ### 已知问题
 
 - **图形/视频稳定性**：0.8.0 在本机 Sequoia 上已启用挂死恢复钩子，但不保证所有故障都能恢复。HEVC Main/Main10 的强制硬解短样片测试通过；IPTV 播放仍出现过 GPU 挂起和 WindowServer watchdog 五国。不能由“支持硬解”推导所有播放器稳定。
-- **HDR**：已通过修正 CoreDisplay 的 CPU 代数判断开放内屏 EDR（potential/current EDR 2.0，QuickTime 播放 PQ/BT.2020 10-bit HEVC 实测 current EDR 2.0）。系统设置没有内屏 HDR 开关属正常（仅外接 HDR10 显示器有）。Safari 的 YouTube 4K/HDR 仍不可用：本机 WebKit 不支持 YouTube 使用的 VP9/AV1（`(dynamic-range: high)` 已匹配，属编解码器限制而非 EDR 问题）；请用 QuickTime 或 HEVC HDR 片源验证。
+- **HDR**：已通过修正 CoreDisplay 的 CPU 代数判断开放内屏 EDR（potential/current EDR 2.0，QuickTime 播放 PQ/BT.2020 10-bit HEVC 实测 current EDR 2.0）。系统设置没有内屏 HDR 开关属正常（仅外接 HDR10 显示器有）。Safari 的 YouTube 4K/HDR 不可用：本机 WebKit 不支持 YouTube 使用的 VP9/AV1（`(dynamic-range: high)` 已匹配，属编解码器限制而非 EDR 问题）。Chrome 有 VP9/AV1，但 Chromium 在 x86 内屏且潜在 EDR ≤ 2.0 时刻意关闭 HDR（[crbug 1402882](https://crbug.com/1402882)）；用 `tools/chrome-hdr/chrome-hdr-launch.sh`（或按 README 装成 “Chrome HDR” 启动器）以 `--force-color-profile=hdr10` 启动 Chrome 后，实测 YouTube 提供并播放 2160p60 HDR（format 337，VP9.2），播放时 EDR 达到 2.0。
+
+  **Chrome HDR 启动器（可选）**：
+
+  ```bash
+  sudo tools/chrome-hdr/install-chrome-hdr.sh
+  ```
+
+  之后双击 `/Applications/Chrome HDR.app` 即可；它会先退出 Chrome，再带 HDR 配置重新启动。
 
 - **整机睡眠（S3）**：FADT 里开着 `LOW_POWER_S0_IDLE_CAPABLE`，DSDT 的 `_S3` 只有在 `If (SS3)` 时才定义。macOS 进 S3 后唤醒会卡在固件阶段（`Sleep Wake failure in EFI 0x22 0x1f`），然后冷启动。
 - **休眠**：
@@ -303,6 +311,7 @@ tools/install.sh            安装后工具一键安装
 tools/audio/                扬声器服务（lggram-audiod）和手动功放脚本
 tools/wifikick/             开机 Wi-Fi 自动重连
 tools/touchpad/             vi2ckick 和 VoodooI2CHID 编译脚本
+tools/chrome-hdr/           Chrome HDR 启动器（x86 内屏 HDR 限制的绕行方案）
 ```
 
 ## 致谢与许可
@@ -336,7 +345,7 @@ OpenCore 1.0.8 EFI for the **LG gram Style 16 (16Z90RS, i5-1340P, Iris Xe A7A0, 
 - Internal-panel HDR (EDR): the CoreDisplay CPU-generation check is corrected for this non-SGX Raptor Lake-P, raising `maximumPotentialExtendedDynamicRangeColorComponentValue` from 1.0 to 2.0. QuickTime playback of a PQ/BT.2020 10-bit HEVC clip measured a live `maximumExtendedDynamicRangeColorComponentValue` of 2.0. macOS offers no HDR toggle for built-in panels (that switch is only for external HDR10 displays); internal HDR is EDR-based. Requires `-wex-hdrleaf2 -wex-hdradapt`, and ordinary CPU feature queries are unchanged.
 
 **Not working / unresolved**:
-- Safari/YouTube 4K and HDR playback: this WebKit build supports HEVC/H.264 but not VP9/AV1, which YouTube uses for 4K and HDR streams. `(dynamic-range: high)` already matches in WebKit, so this is a codec limitation rather than an EDR one; use QuickTime or an HEVC HDR source to exercise the EDR path.
+- Safari/YouTube 4K and HDR playback: this WebKit build supports HEVC/H.264 but not VP9/AV1, which YouTube uses for 4K and HDR streams. `(dynamic-range: high)` already matches in WebKit, so this is a codec limitation rather than an EDR one; use QuickTime or an HEVC HDR source to exercise the EDR path. Chrome has VP9/AV1 but deliberately disables HDR on x86 built-in displays when potential EDR <= 2.0 ([crbug 1402882](https://crbug.com/1402882)); `tools/chrome-hdr/chrome-hdr-launch.sh` starts Chrome with `--force-color-profile=hdr10`, after which YouTube offers and plays 2160p60 HDR (format 337, VP9.2) with live EDR 2.0.
 - IPTV playback can still hang the GPU and lead to a WindowServer watchdog panic, even with the 0.8.0 recovery hook active.
 - S3 sleep: the firmware is Modern-Standby only, so resume becomes a cold boot
 - Hibernation: the image is never written, even with HibernationFixup
