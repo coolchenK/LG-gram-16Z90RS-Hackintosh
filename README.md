@@ -60,22 +60,20 @@ LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）�
 | 合盖 | ✅ | 只关屏，系统继续运行（`pmset disablesleep 1`） |
 | 整机睡眠（S3） | ❌ | 固件按现代待机（S0ix）设计，S3 唤醒会冷启动，已禁用 |
 | 休眠（写入硬盘） | ❌ | 试过 HibernationFixup，镜像写不进去，已放弃（见[已知问题](#已知问题)） |
-| 键盘 | ✅ | VoodooPS2；Fn 亮度键可用 |
-| 其他 Fn 键 | ❌ | 走 LG WMI，macOS 下无驱动 |
+| 键盘 | ✅ | VoodooPS2；Fn 亮度键、声音键可用 |
 | 触控板 | ✅ | 多指手势；轮询模式；本仓库补丁修复"开机后不响应" |
 | 扬声器 | ✅ | 需安装 `lggram-audiod`（初始化 4 颗功放、打开 0x17 引脚） |
-| 耳机孔 | ❔ | 未测试 |
+| 耳机孔 | ✅ | 正常 |
 | 内置麦克风 | ❌ | Intel SST 数字麦克风（PCH DMIC），macOS 不支持 |
 | Wi-Fi | ✅ | AirportItlwm（Sequoia alpha）；偶尔开机不自动连接，`wifikick` 会自动重连 |
 | Wi-Fi 7 MLO / 仅 WPA3 网络 | ❌ | AirportItlwm 不支持 WPA3 |
 | 蓝牙 | ✅ | lshbluesky 分支 IntelBluetoothFirmware 2.5.3 + 本仓库补丁 |
 | NVMe 硬盘 | ✅ | NVMeFix |
 | 电池 | ✅ | ECEnabler + SMCBatteryManager |
-| 自动亮度 / 环境光传感器 | ❔ | macOS 尚无可用的环境光数据路径；硬件类型与 Windows 自适应亮度机制待核实，不能仅凭缺少 ACPI0008 判定无硬件 |
+| 自动亮度 / 环境光传感器 | ❔ | macOS 尚无可用的环境光数据路径 |
 | 摄像头 | ✅ | |
 | USB | ✅ | 没做 USB 端口映射，但实测可用 |
 | HDMI / USB-C 视频输出 | ❔ | 未测试 |
-| 指纹 | ❌ | 黑苹果普遍不支持 |
 
 ## 安装步骤
 
