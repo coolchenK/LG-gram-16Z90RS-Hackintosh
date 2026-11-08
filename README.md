@@ -51,9 +51,11 @@ LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）�
 | 硬件 | 状态 | 说明 |
 |---|---|---|
 | CPU 电源管理 | ✅ | 16 线程，XCPM；"关于本机"显示 i5-1340P（RestrictEvents） |
-| 核显加速 | ✅ | Metal 2 / OpenGL，WhateverXe + 本仓库补丁 + WhateverXe Graphics 0.4.0 |
+| 核显加速 | ✅ | Metal 2 / OpenGL，WhateverXe + 本仓库补丁 + WhateverXe Graphics 0.4.1 |
 | 内屏 120 Hz HiDPI | ✅ | 3200×2000，24 位色，无色带 |
 | 内屏亮度 | ✅ | DPCD AUX 背光（11 位）；Fn 亮度键可用 |
+| HEVC Main / Main10 硬解 | ✅ | VideoToolbox 强制硬解测试：720p、24 fps，各 96/96 帧，零解码错误；不代表所有直播/转换路径稳定 |
+| 内屏 HDR | ❌ | 面板原厂 EDID 声明 PQ/BT.2020，Windows 可开启；已恢复完整 EDID，但当前 macOS 未提供 HDR 模式，仍在排查 |
 | 自动关屏 / 锁屏后点亮 | ✅ | 需要 `-nodisplaysleepDC6 -nopsr`，否则点亮后整机冻结（见[补丁说明](#3-关屏再点亮整机冻结)） |
 | 合盖 | ✅ | 只关屏，系统继续运行（`pmset disablesleep 1`） |
 | 整机睡眠（S3） | ❌ | 固件按现代待机（S0ix）设计，S3 唤醒会冷启动，已禁用 |
@@ -69,7 +71,7 @@ LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）�
 | 蓝牙 | ✅ | lshbluesky 分支 IntelBluetoothFirmware 2.5.3 + 本仓库补丁 |
 | NVMe 硬盘 | ✅ | NVMeFix |
 | 电池 | ✅ | ECEnabler + SMCBatteryManager |
-| 环境光传感器 | ❌ | 本机没有对应硬件（无 ACPI0008 / ISH） |
+| 自动亮度 / 环境光传感器 | ❔ | macOS 尚无可用的环境光数据路径；硬件类型与 Windows 自适应亮度机制待核实，不能仅凭缺少 ACPI0008 判定无硬件 |
 | 摄像头 | ✅ | |
 | USB | ✅ | 没做 USB 端口映射，但实测可用 |
 | HDMI / USB-C 视频输出 | ❔ | 未测试 |
@@ -128,7 +130,7 @@ mountvol S: /D
 
 ### 6. 安装后
 
-1. **核显加速**：安装 [WhateverXe Graphics 0.4.0](https://github.com/b00t0x/WhateverXe-Graphics/releases) 的 pkg，重启。EFI 里已经带了它要求的 AMFIPass 1.4.1 Mod 和 SIP 设置。
+1. **核显加速**：安装 [WhateverXe Graphics 0.4.1](https://github.com/b00t0x/WhateverXe-Graphics/releases) 的 pkg，重启。EFI 里已经带了它要求的 AMFIPass 1.4.1 Mod 和 SIP 设置。
 2. **辅助工具**（需要 Xcode Command Line Tools，`xcode-select --install`）：
 
    ```bash
@@ -183,7 +185,7 @@ macOS 下挂载 LG 恢复分区：`sudo mount -t msdos /dev/disk0s9 /tmp/lgefi`�
 |---|---|---|---|
 | Lilu | 1.7.2 | acidanthera | |
 | VirtualSMC / SMCBatteryManager / SMCProcessor | 1.3.8 | acidanthera | |
-| WhateverXe | 0.7.0 + 本地补丁 | [b00t0x/WhateverXe](https://github.com/b00t0x/WhateverXe) | 用 `patches/WhateverXe-0.7.0-lg-gram-rplp-edp.patch` 自行编译 |
+| WhateverXe | 0.8.0 + 本地补丁 | [b00t0x/WhateverXe](https://github.com/b00t0x/WhateverXe) | 用 `patches/WhateverXe-0.8.0-lg-gram-rplp-edp.patch` 自行编译 |
 | AMFIPass | 1.4.1 Mod | [WhateverXe-Graphics extras](https://github.com/b00t0x/WhateverXe-Graphics) | WhateverXe Graphics 要求，不能换成上游版 |
 | AppleALC | 1.9.8 | acidanthera | layout-id 3 |
 | RestrictEvents | 1.1.6 | acidanthera | CPU 名称 |
@@ -215,7 +217,7 @@ macOS 下挂载 LG 恢复分区：`sudo mount -t msdos /dev/disk0s9 /tmp/lgefi`�
 
 - **CPU 伪装**：`Kernel > Emulate`，`Cpuid1Data = 55060A00 00008000 …`，`Cpuid1Mask = FFFFFFFF 0000FF00 …`；`ProvideCurrentCpuInfo = true`。大小核混合的 i5-1340P 不这样设置，会卡在 `EXITBS:START`。
 - **处理器类型**：`ProcessorType = 0x0F01`，8 核以上 RestrictEvents 才会显示自定义 CPU 名。
-- **核显**：`framebuffer-patch-enable`、`framebuffer-stolenmem = 0000C003`；`AAPL00,override-no-connect` 只覆盖 EDID 基本块（128 字节）。
+- **核显**：`framebuffer-patch-enable`、`framebuffer-stolenmem = 0000C003`；`AAPL00,override-no-connect` 使用通过 DDC 读取并校验的原厂完整 EDID（256 字节），保留 DisplayID 2.0 中的 PQ、BT.2020 和 HDR 静态元数据。此前 128 字节覆盖值隐藏了扩展块。恢复元数据后显示与 HEVC 硬解正常，但 macOS HDR 模式仍未开放。
 - **声卡**：`layout-id = 3`。
 - **蓝牙**：NVRAM 里的 `bluetoothExternalDongleFailed = 00` 和 `bluetoothInternalControllerInfo` 全 0，同时写在 `Add` 和 `Delete` 里。
 
@@ -223,7 +225,7 @@ macOS 下挂载 LG 恢复分区：`sudo mount -t msdos /dev/disk0s9 /tmp/lgefi`�
 
 ### 1. WhateverXe：Raptor Lake-P eDP 内屏（`patches/WhateverXe-*.patch`）
 
-上游 WEX 0.7.0 的 Raptor Lake-P eDP 路径作者还没在真机上测过。在这台机器上要改的地方：
+上游 WEX 0.8.0 的 Raptor Lake-P eDP 路径作者还没在真机上测过。在这台机器上要改的地方：
 
 1. **背光类型**：`nativePPS0()` 只接受 PWM 背光的内屏。这块 OLED 在 VBT 里登记的是 VESA AUX（类型 5），面板因此没被接管。加 `-wex-auxbl` 后允许接管。
 2. **开机交接**：eDP 开机交接前要先对面板端口执行 `setPortMode(1)`。
@@ -233,7 +235,9 @@ macOS 下挂载 LG 恢复分区：`sudo mount -t msdos /dev/disk0s9 /tmp/lgefi`�
 6. **时序补全**：`setupDisplayTiming` 在 AGDC 回调失败时不写输出，补成先复制输入、再用实际寄存器的值覆盖。顺带修好了色带问题。
 7. **背光写入**：通过 `AppleIntelPort::writeAUX` 写 DPCD `0x722/0x723`。
 
-编译方法：`git clone https://github.com/b00t0x/WhateverXe` → `git checkout d0b7fb6` → `git apply` 补丁 → `python3 tools/build.py --release`。
+编译方法：`git clone https://github.com/b00t0x/WhateverXe` → `git checkout 0.8.0`（`db438fdf4d5fe903f5dfbc65537ed3884e2ea980`）→ `git apply patches/WhateverXe-0.8.0-lg-gram-rplp-edp.patch` → 按上游文档准备 MacKernelSDK 与 Lilu 1.7.2 开发头文件 → `python3 tools/build.py --release`。请将补丁路径替换为本仓库中的实际位置。配套安装 WhateverXe Graphics 0.4.1。
+
+运行上游 CPU 测试前，再应用 `patches/WhateverXe-0.8.0-lg-tests.patch`（只适配测试夹具，不改运行时代码），然后执行 `python3 tools/test.py`。当前 0.8.0 + LG 补丁组合在 macOS 上通过 **208/208** 项检查，覆盖新增 AUX 背光和时序回退逻辑。实机 HEVC/HDR 查询方法见 [诊断工具说明](tools/diagnostics/README.md)。
 
 ### 2. 触控板开机后不响应（`patches/VoodooI2CHID-*.patch`）
 
@@ -274,6 +278,9 @@ ALC298 后面接了 4 颗智能功放（`0x38/0x39/0x3c/0x3d`），需要按 Lin
 | 重置 NVRAM 后默认进了 Windows | 系统设置 → 启动磁盘，重新选 macOS |
 
 ### 已知问题
+
+- **图形/视频稳定性**：0.8.0 在本机 Sequoia 上已启用挂死恢复钩子，但不保证所有故障都能恢复。HEVC Main/Main10 的强制硬解短样片测试通过；IPTV 播放仍出现过 GPU 挂起和 WindowServer watchdog 五国。不能由“支持硬解”推导所有播放器稳定。
+- **HDR**：完整原厂 EDID 已恢复，面板声明 HDR10/PQ；当前 macOS 的 HDR 模式支持与 EDR 余量仍未开放。此项尚未修复。
 
 - **整机睡眠（S3）**：FADT 里开着 `LOW_POWER_S0_IDLE_CAPABLE`，DSDT 的 `_S3` 只有在 `If (SS3)` 时才定义。macOS 进 S3 后唤醒会卡在固件阶段（`Sleep Wake failure in EFI 0x22 0x1f`），然后冷启动。
 - **休眠**：
@@ -316,13 +323,17 @@ EFI 里的二进制和补丁过的组件，版权都归原作者，按各自的�
 OpenCore 1.0.8 EFI for the **LG gram Style 16 (16Z90RS, i5-1340P, Iris Xe A7A0, 3200×2000 120 Hz OLED)** running **macOS Sequoia 15.8.2**, SMBIOS MacBookPro16,2. SMBIOS identifiers in `config.plist` are placeholders: generate your own.
 
 **Working**:
-- Iris Xe acceleration (WhateverXe 0.7.0 + the eDP/DPCD-backlight patch in `patches/`, plus WhateverXe Graphics 0.4.0), 120 Hz HiDPI and brightness, including Fn keys
+- Iris Xe acceleration (WhateverXe 0.8.0 + the eDP/DPCD-backlight patch in `patches/`, plus WhateverXe Graphics 0.4.1), 120 Hz HiDPI and brightness, including Fn keys
 - Display off/on, which needs the Apple TGL framebuffer boot-args `-nodisplaysleepDC6 -nopsr`; without them waking the display ends in a display-interrupt storm and a hard freeze
 - I2C touchpad (VoodooI2C CI + a VoodooI2CHID patch that writes the PTP Selective Reporting feature with its full 2-byte payload)
 - Speakers (`tools/audio` initialises the 4 smart amps), Wi-Fi (AirportItlwm), Bluetooth (lshbluesky IntelBluetoothFirmware 2.5.3 + an Intel-only IntelBTPatcher filter), NVMe and battery
 - Camera and USB
+- Hardware HEVC Main/Main10 decoding: forced-hardware VideoToolbox tests decoded 96/96 frames for each 720p24 sample, with zero decode errors. This is not a long-duration or all-player stability guarantee.
+- The full 256-byte factory EDID is retained, including the original DisplayID 2.0 timings and HDR metadata; no HDR capabilities are invented.
 
-**Not working**:
+**Not working / unresolved**:
+- HDR output is not enabled in macOS despite the panel's native PQ/BT.2020 declaration and working HDR in Windows.
+- IPTV playback can still hang the GPU and lead to a WindowServer watchdog panic, even with the 0.8.0 recovery hook active.
 - S3 sleep: the firmware is Modern-Standby only, so resume becomes a cold boot
 - Hibernation: the image is never written, even with HibernationFixup
 - Internal DMIC, LG WMI Fn keys other than brightness, Wi-Fi 7 MLO / WPA3-only networks

@@ -1,0 +1,427 @@
+diff --git a/tests/display13_cursor_resize.py b/tests/display13_cursor_resize.py
+--- a/tests/display13_cursor_resize.py
++++ b/tests/display13_cursor_resize.py
+@@ -1,11 +1,12 @@
+ #!/usr/bin/env python3
+ """Replay production WM preparation while CURCNTR still holds the old size."""
+ from pathlib import Path
++from lg_runtime_helpers import function
+ import re, subprocess, tempfile
+ r=Path(__file__).resolve().parents[1]
+ s=(r/'WhateverXe/kern_xe.cpp').read_text()
+ body=re.search(r'void XE::adlnWMSetup\(.*?\n\}',s,re.S).group()
+-code=(r/'tests/display13_cursor_resize_fixture.cpp').read_text().replace('// PRODUCTION_SETUP',body)
++code=(r/'tests/display13_cursor_resize_fixture.cpp').read_text().replace('// PRODUCTION_SETUP',body).replace('// LG_PIXEL_HELPER',function(s,'display13PixelClockHz'))
+ with tempfile.TemporaryDirectory(prefix='cursor-resize-') as d:
+  p=Path(d);(p/'test.cpp').write_text(code)
+  subprocess.run(['clang++','-std=c++17','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+diff --git a/tests/display13_cursor_resize_fixture.cpp b/tests/display13_cursor_resize_fixture.cpp
+--- a/tests/display13_cursor_resize_fixture.cpp
++++ b/tests/display13_cursor_resize_fixture.cpp
+@@ -12,7 +12,14 @@
+ void IOLockUnlock(int*){assert(locks);--locks;}
+ struct OSObject {unsigned size;OSObject *getMetaClass(){return this;}unsigned getClassSize(){return size;}};
+ using IOService=OSObject;
+-struct Map {std::map<uint32_t,uint32_t> r;};
++struct Map {std::map<uint32_t,uint32_t> r;
++ std::vector<uint32_t> mmio=std::vector<uint32_t>(0x1000000/4);
++ uint64_t mappedLength=0x1000000;
++ uintptr_t getVirtualAddress(){return reinterpret_cast<uintptr_t>(mmio.data());}
++ uint64_t getLength(){return mappedLength;}
++};
++using IOMemoryMap=Map;
++#define SYSLOG(...) ((void)0)
+ struct Display13FBDBUFIO {Map *map;uint32_t read(uint32_t reg){assert(map->r.count(reg));return map->r[reg];}};
+ static unsigned selectedPipe;
+ namespace TGLFBBinding {
+@@ -44,8 +51,10 @@
+  static bool dsiSharedWriterStopped(void*,unsigned){return false;}
+  static void adlnWMSetup(OSObject*,OSObject*,bool);
+ }state,*callbackXE=&state;
+-uint64_t adjust(void*,void*,void*,bool cursor,void*){assert(cursor);return 135255000;}
++static uint64_t adjustedPixel=135255000;
++uint64_t adjust(void*,void*,void*,bool cursor,void*){assert(cursor);return adjustedPixel;}
+ template<class T>void put(void *p,unsigned off,T v){memcpy((uint8_t*)p+off,&v,sizeof(v));}
++// LG_PIXEL_HELPER
+ // PRODUCTION_SETUP
+ alignas(16) static uint8_t ctl[0x1c20],fb[0x4b90],path[0x3730],plane[0x1c8];
+ static int mutex;
+@@ -53,7 +62,7 @@
+  memset(ctl,0,sizeof(ctl));memset(fb,0,sizeof(fb));memset(path,0,sizeof(path));memset(plane,0,sizeof(plane));
+  ((OSObject*)ctl)->size=sizeof(ctl);((OSObject*)fb)->size=sizeof(fb);
+  ((OSObject*)path)->size=sizeof(path);((OSObject*)plane)->size=sizeof(plane);
+- selectedPipe=pipe;display13FBPower={};auto &c=display13FBPower;
++ adjustedPixel=135255000;selectedPipe=pipe;display13FBPower={};auto &c=display13FBPower;
+  c.lock=&mutex;c.controller=(IOService*)ctl;c.map=&map;c.engineEnabled=true;c.dbuf.begun=true;
+  c.pipe[pipe].memoryFramebuffer=(IOService*)fb;
+  c.dbuf.pipe[pipe].cursor=pipe?Display13DBUF::Range{2048,2088}:Display13DBUF::Range{0,40};
+@@ -78,7 +87,27 @@
+   assert(Display13WM::cursorMatches(controls[old],plan.width)==(old==next));
+   assert(Display13WM::cursorMatches(controls[next],plan.width));
+  }
+- for(unsigned invalid:{0U,32U,512U}){
++  // The new helper must remain an identity for legitimate donor Hz values.
++  assert(display13PixelClockHz(20000000,0,nullptr)==20000000);
++  assert(display13PixelClockHz(2000000000,0,nullptr)==2000000000);
++  assert(!display13PixelClockHz(19999999,2200,nullptr));
++  assert(!display13PixelClockHz(2000000001,2200,nullptr));
++  {
++   Map fallback;setup(fallback,0,0x10000027,128);
++   fallback.mmio[0x45270/4]=67;adjustedPixel=UINT64_MAX;
++   const auto before=fallback.r;
++   XE::adlnWMSetup((OSObject*)plane,(OSObject*)path,true);
++   const auto &plan=display13FBPower.pipe[0].wm[1];
++   const uint64_t expected=1126ULL*16000000/(2*67-1);
++   assert(!display13FBPower.watermarkFaulted && plan.status==Display13WM::Status::Complete);
++   assert(plan.pixelHz==expected && Display13WM::pipeLineTime(1126,expected)==67 && fallback.r==before);
++   assert(!display13PixelClockHz(UINT64_MAX,0,&fallback));
++   assert(!display13PixelClockHz(UINT64_MAX,16385,&fallback));
++   fallback.mappedLength=4096;assert(!display13PixelClockHz(UINT64_MAX,1126,&fallback));
++   fallback.mappedLength=0x1000000;fallback.mmio[0x45270/4]=0;
++   assert(!display13PixelClockHz(UINT64_MAX,1126,&fallback));
++  }
++  for(unsigned invalid:{0U,32U,512U}){
+   Map map;setup(map,0,0x10000027,invalid);XE::adlnWMSetup((OSObject*)plane,(OSObject*)path,true);
+   assert(display13FBPower.watermarkFaulted);
+  }
+diff --git a/tests/display13_dbuf_setup.py b/tests/display13_dbuf_setup.py
+--- a/tests/display13_dbuf_setup.py
++++ b/tests/display13_dbuf_setup.py
+@@ -2,13 +2,14 @@
+ """Exercise the production allocation adapter with real DBUF ownership."""
+ from pathlib import Path
+ from production_source import read_source
++from lg_runtime_helpers import function
+ import re, subprocess, tempfile
+ r = Path(__file__).resolve().parents[1]
+ s = read_source(r/'WhateverXe/kern_xe.cpp')
+ guard = re.search(r'bool XE::dsiSharedWriterStopped\(.*?\n\}', s, re.S).group()
+ body = re.search(r'void XE::adlnSetupDBUFPipe\(.*?\n\}', s, re.S).group()
+ pipewm = re.search(r'void XE::wrapAlderLakeNPipeWMSetup\(.*?\n\}', s, re.S).group()
+-code = (r / 'tests/display13_dbuf_setup_fixture.cpp').read_text().replace('// PRODUCTION_SETUP', guard+'\n'+body+'\n'+pipewm)
++code = (r / 'tests/display13_dbuf_setup_fixture.cpp').read_text().replace('// PRODUCTION_SETUP', guard+'\n'+body+'\n'+pipewm).replace('// LG_TIMING_HELPERS', '\n'.join(function(s,n) for n in ['display13PixelClockHz','display13RepairPendingTiming','display13LineTimeFallback','display13WMDiag']))
+ with tempfile.TemporaryDirectory(prefix='dbuf-setup-') as d:
+     p = Path(d)
+     (p / 'test.cpp').write_text(code)
+diff --git a/tests/display13_dbuf_setup_fixture.cpp b/tests/display13_dbuf_setup_fixture.cpp
+--- a/tests/display13_dbuf_setup_fixture.cpp
++++ b/tests/display13_dbuf_setup_fixture.cpp
+@@ -3,6 +3,7 @@
+ #include "kern_display13_wm.hpp"
+ #include <cassert>
+ #include <map>
++#include <vector>
+ #include <cstdio>
+ using IOLock=int;using IORecursiveLock=int;
+ static unsigned ownerDepth,fbDepth;
+@@ -13,6 +14,10 @@
+ struct OSObject {unsigned size;OSObject *getMetaClass(){return this;}unsigned getClassSize(){return size;}};
+ using IOService=OSObject;
+ struct Map {
++ std::vector<uint32_t> mmio=std::vector<uint32_t>(0x1000000/4);
++ uint64_t mappedLength=0x1000000;
++ uintptr_t getVirtualAddress(){return reinterpret_cast<uintptr_t>(mmio.data());}
++ uint64_t getLength(){return mappedLength;}
+  unsigned reads=0;std::map<uint32_t,uint32_t> r;
+  Map() {
+   r[0x45404]=0xFC0F;r[0x4438C]=0x1C000700;
+@@ -25,6 +30,8 @@
+   for(unsigned i=0;i<4;++i)r[Display13DBUF::regs[i]]=i<2?0xC040C000:0x40C000;
+  }
+ };
++using IOMemoryMap=Map;
++#define SYSLOG(...) ((void)0)
+ struct Display13FBDBUFIO {
+  Map *map;bool readable(uint32_t reg){return map->r.count(reg);}
+  uint32_t read(uint32_t reg){assert(readable(reg));++map->reads;return map->r[reg];}
+@@ -99,6 +106,7 @@
+ IOService *pendingBackingFB=nullptr;
+ struct {bool modeReady=false;} dsiPendingBacking;
+ bool dsiPendingTarget(IOService *fb){return fb && fb==pendingBackingFB;}
++// LG_TIMING_HELPERS
+ // PRODUCTION_SETUP
+ alignas(16) static uint8_t ctl[0x1c20],fb[3][0x4b90],paths[3][0x3730],planes[3][0x1c8];
+ static int ownerMutex,frameMutex;
+@@ -113,7 +121,39 @@
+  Display13FBDBUFIO io{&map};assert(Display13DBUF::begin(io,c.dbuf,7)==Display13DBUF::Status::Complete);
+  badBinding=failPrimary=failWM=false;armCalls=0;records.clear();nextLatch={};
+ }
++static void lgTimingTests() {
++ alignas(8) uint8_t path[0x3730]{};uint32_t pending[0x1000/4]{};
++ auto live=reinterpret_cast<uint32_t*>(path+0x128);
++ live[4]=(3319U<<16)|3199;live[5]=0x01020304;live[6]=0x05060708;
++ live[7]=(2015U<<16)|1999;live[8]=0x11121314;live[9]=0x15161718;live[10]=(3199U<<16)|1999;
++ pending[4]=0x00470047;pending[10]=live[10];pending[2]=0x12345678;pending[11]=0x87654321;
++ uint32_t expected[0x1000/4];memcpy(expected,pending,sizeof(expected));
++ memcpy(expected+4,live+4,6*sizeof(uint32_t));
++ assert(display13RepairPendingTiming(pending,path));assert(!memcmp(pending,expected,sizeof(expected)));
++ assert(!display13RepairPendingTiming(pending,path)); // already coherent, leave it alone.
++ assert(!display13RepairPendingTiming(nullptr,path) && !display13RepairPendingTiming(pending,nullptr));
++ for(unsigned bad=0;bad<5;++bad) {
++  pending[4]=0x00470047;pending[7]=0;pending[10]=live[10];
++  const uint32_t h=live[4],v=live[7];
++  if(bad==0)pending[10]^=1; // Different mode, never adopt running timing.
++  if(bad==1)live[4]=(3319U<<16)|3000;
++  if(bad==2)live[4]=(3199U<<16)|3199; // no horizontal blanking
++  if(bad==3)live[7]=(2015U<<16)|1900;
++  if(bad==4)live[7]=(1999U<<16)|1999; // no vertical blanking
++  memcpy(expected,pending,sizeof(expected));assert(!display13RepairPendingTiming(pending,path));
++  assert(!memcmp(expected,pending,sizeof(expected)));live[4]=h;live[7]=v;
++ }
++ // The pointer fallback uses bounded pending-record storage, then exact BAR size.
++ alignas(8) uint64_t storage[0x1000/8]{};storage[4]=148500000;
++ auto address=reinterpret_cast<uint64_t>(&storage[4]);
++ assert(display13LineTimeFallback(2200,address,storage,nullptr)==119);
++ storage[4]=148500;assert(display13LineTimeFallback(2200,address,storage,nullptr)==511); // Raw Hz saturates; no implicit kHz conversion.
++ Map mmio;mmio.mmio[0x45270/4]=119;
++ assert(display13LineTimeFallback(2200,0,nullptr,&mmio)==119);
++ mmio.mappedLength=4096;assert(!display13LineTimeFallback(2200,0,nullptr,&mmio));
++}
+ int main(){
++  lgTimingTests();
+  using S=Display13WM::Status;using C=Display13WM::LatchCheck;
+  // Exercise the production default/optimized callback after a cold lost
+  // bank, including the deferred case where native PG powers it later.
+diff --git a/tests/display13_panel_runtime.py b/tests/display13_panel_runtime.py
+--- a/tests/display13_panel_runtime.py
++++ b/tests/display13_panel_runtime.py
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env python3
+ """Execute production PPS/PWM wrappers with actual PG bridge and MMIO adapter."""
+ from pathlib import Path
++from lg_runtime_helpers import aux_backlight
+ import re,sys,subprocess,tempfile,hashlib
+ r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_xe.cpp').read_text()
+ names=['display13PanelTarget','display13PanelPowerReference','display13PanelCapture','display13PanelTiming','display13PanelBrightness','display13PanelPWMEnable','wrapDisplay13PanelPower']
+@@ -17,7 +18,7 @@
+  assert b[0x487df:0x487e2]==bytes.fromhex('83 ca 03')
+  assert b[0x4875e:0x48761]==bytes.fromhex('83 e2 f6')
+  assert b[0x48abc:0x48abe]==bytes.fromhex('31 c0')
+-code=(r/'tests/display13_panel_runtime_fixture.cpp').read_text().replace('// PRODUCTION_IO',io).replace('// METHODS',methods)
++code=(r/'tests/display13_panel_runtime_fixture.cpp').read_text().replace('// PRODUCTION_IO',io).replace('// METHODS',methods).replace('// LG_AUX_HELPER',aux_backlight(s))
+ with tempfile.TemporaryDirectory(prefix='display13-panel-') as d:
+  p=Path(d);(p/'test.cpp').write_text(code)
+  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+diff --git a/tests/display13_panel_runtime_fixture.cpp b/tests/display13_panel_runtime_fixture.cpp
+--- a/tests/display13_panel_runtime_fixture.cpp
++++ b/tests/display13_panel_runtime_fixture.cpp
+@@ -4,6 +4,7 @@
+ #include "kern_display13_output_wiring.hpp"
+ #include <cassert>
+ #include <vector>
++#include <map>
+ #include <new>
+ #include <fstream>
+ #include <iterator>
+@@ -42,6 +43,33 @@
+  static uint32_t display13PanelBrightness(void*,uint32_t);static void display13PanelPWMEnable(void*);
+  static uint32_t wrapDisplay13PanelPower(void*,uint32_t);
+ };XE *XE::callbackXE;
++// Real production AUX logic, mocked only at the donor's readAUX/writeAUX boundary.
++using mach_vm_address_t=uintptr_t;
++#define SYSLOG(...) ((void)0)
++// LG_AUX_HELPER
++struct AuxDevice {
++ std::map<unsigned,std::vector<uint8_t>> data{{0x701,{4,6,0}},{0x721,{0xa1}},
++  {0x724,{11,0,0}},{0x720,{0xa0}},{0x722,{0,0}}};
++ std::vector<std::pair<unsigned,std::vector<uint8_t>>> writes;
++ unsigned reads=0,failRead=0,failWrite=0;
++ static uint32_t read(void *port,uint32_t reg,void *bytes,uint32_t size) {
++  auto &d=*static_cast<AuxDevice*>(port);++d.reads;
++  if(d.failRead==reg)return 1;
++  assert(d.data.count(reg) && d.data[reg].size()>=size);memcpy(bytes,d.data[reg].data(),size);return 0;
++ }
++ static uint32_t write(void *port,uint32_t reg,void *bytes,uint32_t size) {
++  auto &d=*static_cast<AuxDevice*>(port);
++  assert((reg==0x721 && size==1) || (reg==0x722 && (size==1 || size==2)) || (reg==0x720 && size==1));
++  if(d.failWrite==reg)return 1;
++  const auto b=static_cast<uint8_t*>(bytes);std::vector<uint8_t> value(b,b+size);d.writes.push_back({reg,value});d.data[reg]=value;return 0;
++ }
++ void attach() {
++  display13AuxPort=this;display13ReadAUXFn=reinterpret_cast<uintptr_t>(read);
++  display13WriteAUXFn=reinterpret_cast<uintptr_t>(write);
++  display13AuxReady=display13AuxWide=display13AuxEnable=display13AuxEnabled=false;
++  display13AuxMax=display13AuxCalls=0;
++ }
++};
+ // METHODS
+ unsigned calls=0;bool timeout=false;uint32_t nativeResult=0;
+ uint32_t nativePower(void *controller,uint32_t state) {
+@@ -85,7 +113,44 @@
+ void lightDelay(unsigned){}
+ void jump(uint8_t *site,uintptr_t target){site[0]=0x48;site[1]=0xb8;memcpy(site+2,&target,8);site[10]=0xff;site[11]=0xe0;}
+ void redirect(uint8_t *image,unsigned call,unsigned stub,uintptr_t target){assert(image[call]==0xe8);jump(image+stub,target);int32_t delta=stub-call-5;memcpy(image+call+1,&delta,4);}
++static void lgAuxTests() {
++  // Successful AUX routing changes the OLED DPCD level and controller cache,
++  // while preserving the PWM register tested above for conventional panels.
++  for(bool wide:{false,true}) {
++   Fixture oled;AuxDevice aux;aux.attach();
++   oled.xe.firmwarePorts.panel.auxBacklight=true;oled.xe.firmwarePorts.panel.backlightType=5;
++   if(!wide)aux.data[0x701][1]=2;
++   const auto pwm=oled.map.at(0xC8258);const unsigned maximum=wide?2047:255;
++   for(unsigned b:{0U,1U,32768U,65535U}) {
++    assert(!XE::display13PanelBrightness(oled.ctl,b));
++    unsigned expected=(uint64_t(b)*maximum+32767)/65535;if(b&&!expected)expected=1;
++    assert(display13AuxMax==maximum && display13AuxWide==wide);
++    const auto &bytes=aux.data[0x722];assert(bytes.size()==(wide?2U:1U));
++    assert((wide?(unsigned(bytes[0])<<8)|bytes[1]:bytes[0])==expected);
++    assert(Display13FBMemory::field<unsigned>(oled.ctl,0xE58)==b && oled.map.at(0xC8258)==pwm);
++    oled.balanced();
++   }
++   assert(aux.data[0x721][0]==0xa2 && aux.data[0x720][0]==0xa1);
++   unsigned modeWrites=0,enableWrites=0;
++   for(const auto &w:aux.writes){modeWrites+=w.first==0x721;enableWrites+=w.first==0x720;}
++   assert(modeWrites==1 && enableWrites==1); // preserve upper bits; no repeated enable.
++   const auto count=aux.writes.size();assert(!display13AuxBacklightSet(65536) && aux.writes.size()==count);
++  }
++  // A failed capability/mode/brightness transfer must not report success.
++  for(unsigned fault=0;fault<5;++fault) {
++   AuxDevice aux;aux.attach();
++   if(fault==0)display13AuxPort=nullptr;
++   if(fault==1)aux.failRead=0x701;
++   if(fault==2)aux.data[0x701][1]&=~2U;
++   if(fault==3)aux.failWrite=0x721;
++   if(fault==4)aux.failWrite=0x722;
++   assert(!display13AuxBacklightSet(32768));
++   for(const auto &w:aux.writes)assert(w.first!=0x722 && w.first!=0x720);
++  }
++  display13AuxPort=nullptr;display13ReadAUXFn=display13WriteAUXFn=0;
++}
+ int main(int argc,char **argv) {
++ lgAuxTests();
+  for(bool gate:{false,true})for(bool fail:{false,true}) {
+   Fixture f;if(gate)f.map.at(0xC2020)|=1U<<29;timeout=fail;
+   assert(XE::wrapDisplay13PanelPower(f.ctl,2)==(fail?kIOReturnNotReady:0));
+@@ -113,7 +178,7 @@
+  // The actual adapter's write allowlist must not grant a second PPS owner.
+  Display13FBPanelIO io{&f.map};io.write(0xC7204,0);assert(f.map.at(0xC7204)==0x67);
+  io.write(0x60400,123);assert(!f.map.at(0x60400));
+- if(argc>1) {
++  if(argc>1) {
+   std::ifstream input(argv[1],std::ios::binary);std::vector<char> bytes((std::istreambuf_iterator<char>(input)),{});
+   assert(!bytes.empty() && bytes.size()<0x400000);
+   auto image=static_cast<uint8_t *>(mmap(nullptr,0x400000,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_ANON|MAP_PRIVATE,-1,0));assert(image!=MAP_FAILED);
+diff --git a/tests/display13_wm.cpp b/tests/display13_wm.cpp
+--- a/tests/display13_wm.cpp
++++ b/tests/display13_wm.cpp
+@@ -312,13 +312,27 @@
+     LatchIO invalidLive(p);invalidLive.oldSurface=true;invalidLive.regs[0x701AC]=UINT32_MAX;
+     assert(latch(invalidLive,invalidLive.snapshot(p)).status==Status::Readback);
+     auto clockPlan=committed.snapshot(p);
+-    assert(clockFits(clockPlan,1305600000) && clockFits(clockPlan,297000000));
+-    assert(!clockFits(clockPlan,296999999));
++    // nativeHz already represents two pixels per CDCLK. Test each consumer
++    // against that budget, with exact-boundary rejection rather than /2 again.
++    assert(clockFits(clockPlan,1305600000) && clockFits(clockPlan,148500000));
++    assert(!clockFits(clockPlan,148499999));
+     auto fasterCursor=cursor;fasterCursor.pixelHz=200000000;
+     auto cursorClockPlan=committed.snapshot(p,&fasterCursor);
+-    assert(clockFits(cursorClockPlan,400000000) && !clockFits(cursorClockPlan,399999999));
++    assert(clockFits(cursorClockPlan,200000000) && !clockFits(cursorClockPlan,199999999));
+     clockPlan.pipePixelHz=200000000;clockPlan.pipeLineTime=pipeLineTime(p.htotal,clockPlan.pipePixelHz);
+-    assert(!clockFits(clockPlan,384000000));
++    assert(clockFits(clockPlan,200000000) && !clockFits(clockPlan,199999999));
++    auto oled=p;oled.pixelHz=809540000;auto oledClock=committed.snapshot(oled);
++    assert(oled.pixelHz>652800000 && clockFits(oledClock,2ULL*652800000));
++    assert(clockFits(oledClock,809540000) && !clockFits(oledClock,809539999));
++    oled.pixelHz=1305600001; // Primary alone exceeds the 2*652.8MHz budget.
++    assert(!clockFits(oledClock,1305600000));
++    oled.pixelHz=809540000;oledClock.pipePixelHz=1305600001;
++    oledClock.pipeLineTime=pipeLineTime(oled.htotal,oledClock.pipePixelHz);
++    assert(!clockFits(oledClock,1305600000));
++    oledClock=committed.snapshot(oled);++oledClock.pipeLineTime;
++    assert(!clockFits(oledClock,1305600000)); // Bandwidth cannot excuse stale timing.
++    oledClock=committed.snapshot(oled);assert(!clockFits(oledClock,0));
++    oledClock.primary=nullptr;assert(!clockFits(oledClock,1305600000));
+     LatchIO afterCrawl(p);afterCrawl.clock=1305600000;
+     assert(latch(afterCrawl,afterCrawl.snapshot(p)).status==Status::Complete && afterCrawl.writes.empty());
+     LatchIO sameFrame(p);sameFrame.frozen=true;
+diff --git a/tests/firmware_readout.py b/tests/firmware_readout.py
+--- a/tests/firmware_readout.py
++++ b/tests/firmware_readout.py
+@@ -15,8 +15,16 @@
+ #include "kern_xelp_platform.hpp"
+ #include "kern_vbt.hpp"
+ #include "kern_dsi_math.hpp"
+-bool auditEnabled=false;
+-bool checkKernelArgument(const char *arg){assert(!strcmp(arg,"-wex-dsi-audit"));return auditEnabled;}
++bool auditEnabled=false,auxEnabled=false;
++unsigned logCalls=0;
++// Logging has no firmware side effects; retain a callable, argument-evaluating sink.
++void mockLog(const char *tag,const char *format,...){assert(!strcmp(tag,"igfx") && format);++logCalls;}
++#define SYSLOG(...) mockLog(__VA_ARGS__)
++bool checkKernelArgument(const char *arg){
++ if(!strcmp(arg,"-wex-dsi-audit"))return auditEnabled;
++ if(!strcmp(arg,"-wex-auxbl"))return auxEnabled;
++ assert(false && "unexpected boot argument");return false;
++}
+ #define OSDynamicCast(type,ptr) (ptr)
+ constexpr unsigned kIODirectionIn=1,kIOMapReadOnly=2;
+ struct OSData {
+@@ -32,7 +40,8 @@
+ struct IOPCIDevice {unsigned reads=0,publications=0;uint32_t configRead32(unsigned off){assert(off==0xfc);++reads;return 0;}
+  std::map<std::string,OSData> properties;
+  OSData *getProperty(const char *key){auto i=properties.find(key);return i==properties.end()?nullptr:&i->second;}
+- void setProperty(const char*,uint32_t,unsigned){++publications;}void setProperty(const char*,const void*,unsigned){++publications;}
++ void setProperty(const char*,uint32_t,unsigned){++publications;}
++ void setProperty(const char *key,const void *p,unsigned n){++publications;properties[key].bytes.assign((const uint8_t*)p,(const uint8_t*)p+n);}
+  void setProperty(const char *key,OSData *d){++publications;properties[key]=*d;}
+ };
+ struct XE {XELP::Profile xeProfile;XELP::VBT::Ports firmwarePorts;void xelpReadFirmware(IOPCIDevice*);};
+@@ -46,7 +55,24 @@
+   assert(!pci.getProperty("WEXDSIFirmwareAudit"));
+   x.xelpReadFirmware(nullptr);
+  }
+- auditEnabled=true;XE x;IOPCIDevice pci;x.xeProfile=XELP::identify(0x46d48086,0);
++  // Replay the production admission and publication against all gates. Firmware
++  // acquisition/parsing is exercised separately; no MMIO is invented here.
++  for(bool flag:{false,true})for(bool valid:{false,true})for(bool blvalid:{false,true})
++   for(unsigned type:{2U,5U,6U}) {
++    XE test;IOPCIDevice device;test.xeProfile=XELP::identify(0xA7A08086,4);
++    auto &p=test.firmwarePorts.panel;p.valid=valid;p.backlightValid=blvalid;
++    p.pwmPresent=true;p.activeLowPWM=true;p.backlightType=type;p.controller=0;p.pwmHz=200;
++    auxEnabled=flag;const auto logs=logCalls;test.xelpReadFirmware(&device);
++    const bool admitted=flag && valid && blvalid && type==5;
++    assert(p.auxBacklight==admitted && logCalls==logs+1);
++    auto facts=device.getProperty("WhateverXeFirmwarePanelBacklight");
++    assert(facts && facts->bytes.size()==7*sizeof(uint32_t));
++    const uint32_t expected[]={uint32_t(blvalid),1,1,type,0,200,uint32_t(admitted)};
++    for(unsigned i=0;i<7;++i)assert(XELP::VBT::u32(facts->bytes.data()+4*i)==expected[i]);
++    assert(device.reads==1 && !device.getProperty("WEXDSIFirmwareAudit"));
++   }
++  auxEnabled=false;
++  auditEnabled=true;XE x;IOPCIDevice pci;x.xeProfile=XELP::identify(0x46d48086,0);
+  x.xelpReadFirmware(&pci);auto absent=pci.getProperty("WEXDSIFirmwareAudit");assert(absent&&absent->bytes.size()==33*4);
+  assert(XELP::VBT::u32(absent->bytes.data()+4)==unsigned(XELP::DSI::ProfileStatus::Bounds));
+  if(argc==2){
+diff --git a/tests/fixtures/boot_argument_names.json b/tests/fixtures/boot_argument_names.json
+--- a/tests/fixtures/boot_argument_names.json
++++ b/tests/fixtures/boot_argument_names.json
+@@ -1,4 +1,5 @@
+ {
++  "-wex-auxbl": [],
+   "-wex-dsi-audit": [],
+   "-wex-dsi-60hz": [],
+   "-wex-dsi-adopt": [],
+diff --git a/tests/lg_runtime_helpers.py b/tests/lg_runtime_helpers.py
+new file mode 100644
+--- /dev/null
++++ b/tests/lg_runtime_helpers.py
+@@ -0,0 +1,17 @@
++"""Extract the LG helper actually compiled into kern_xe.cpp for CPU replay."""
++import re
++
++
++def function(source, name):
++    pattern = (r"static __attribute__\(\(noinline\)\) (?:bool|void|uint32_t|uint64_t) "
++               + re.escape(name) + r"\(.*?\n\}")
++    matches = re.findall(pattern, source, re.S)
++    assert len(matches) == 1, (name, len(matches))
++    return matches[0]
++
++
++def aux_backlight(source):
++    start = source.index("static void *display13AuxPort {};")
++    body = function(source, "display13AuxBacklightSet")
++    end = source.index(body, start) + len(body)
++    return source[start:end]
