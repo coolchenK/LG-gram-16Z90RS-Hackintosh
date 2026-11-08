@@ -53,7 +53,7 @@ LG gram Style 16（16Z90RS，2023 款，i5-1340P / Iris Xe / 3200×2000 OLED）�
 | CPU 电源管理 | ✅ | 16 线程，XCPM；"关于本机"显示 i5-1340P（RestrictEvents） |
 | 核显加速 | ✅ | Metal 2 / OpenGL，WhateverXe + 本仓库补丁 + WhateverXe Graphics 0.4.1 |
 | 内屏 120 Hz HiDPI | ✅ | 3200×2000，24 位色，无色带 |
-| 内屏亮度 | ✅ | DPCD AUX 背光（11 位）；Fn 亮度键可用 |
+| 内屏亮度 | ✅ | DPCD AUX 背光（11 位）；Fn 亮度键可用；自动关屏再唤醒后仍可调（见“本仓库的修复补丁”） |
 | HEVC Main / Main10 硬解 | ✅ | VideoToolbox 强制硬解测试：720p、24 fps，各 96/96 帧，零解码错误；不代表所有直播/转换路径稳定 |
 | 内屏 HDR | ❌ | 面板原厂 EDID 声明 PQ/BT.2020，Windows 可开启；已恢复完整 EDID，但当前 macOS 未提供 HDR 模式，仍在排查 |
 | 自动关屏 / 锁屏后点亮 | ✅ | 需要 `-nodisplaysleepDC6 -nopsr`，否则点亮后整机冻结（见[补丁说明](#3-关屏再点亮整机冻结)） |
@@ -231,11 +231,13 @@ macOS 下挂载 LG 恢复分区：`sudo mount -t msdos /dev/disk0s9 /tmp/lgefi`�
 4. **时钟预算**：`Display13WM::clockFits` 按每时钟 2 像素计算预算（120 Hz 需要约 809.5 MHz 像素时钟，CDCLK 只有 652.8 MHz）。
 5. **刷新率保护**：`SetupTimings` 在苹果驱动里拿到的是未初始化的时序，会除以 0，加了兜底。
 6. **时序补全**：`setupDisplayTiming` 在 AGDC 回调失败时不写输出，补成先复制输入、再用实际寄存器的值覆盖。顺带修好了色带问题。
-7. **背光写入**：通过 `AppleIntelPort::writeAUX` 写 DPCD `0x722/0x723`。
+7. **背光写入**：通过 `AppleIntelPort::writeAUX` 写 DPCD `0x722/0x723`。面板在自动关屏（DPMS/doze）时会复位 DPCD 的亮度模式与使能位：原先只在首次调用时读取并缓存，唤醒后亮度写入会被面板接受但不生效。现在每次调亮度前都会重新读取 `0x720/0x721` 并恢复 AUX 模式/使能，再写亮度值（`patches/WhateverXe-0.8.0-aux-backlight-repaint.patch`）。
 
-编译方法：`git clone https://github.com/b00t0x/WhateverXe` → `git checkout 0.8.0`（`db438fdf4d5fe903f5dfbc65537ed3884e2ea980`）→ `git apply patches/WhateverXe-0.8.0-lg-gram-rplp-edp.patch` → 按上游文档准备 MacKernelSDK 与 Lilu 1.7.2 开发头文件 → `python3 tools/build.py --release`。请将补丁路径替换为本仓库中的实际位置。配套安装 WhateverXe Graphics 0.4.1。
+编译方法：`git clone https://github.com/b00t0x/WhateverXe` → `git checkout 0.8.0`（`db438fdf4d5fe903f5dfbc65537ed3884e2ea980`）→ `git apply patches/WhateverXe-0.8.0-lg-gram-rplp-edp.patch` → `git apply patches/WhateverXe-0.8.0-aux-backlight-repaint.patch`（按顺序应用；第二个补丁修复关屏唤醒后的 AUX 背光重新接管）→ 按上游文档准备 MacKernelSDK 与 Lilu 1.7.2 开发头文件 → `python3 tools/build.py --release`。请将补丁路径替换为本仓库中的实际位置。配套安装 WhateverXe Graphics 0.4.1。
 
-运行上游 CPU 测试前，再应用 `patches/WhateverXe-0.8.0-lg-tests.patch`（只适配测试夹具，不改运行时代码），然后执行 `python3 tools/test.py`。当前 0.8.0 + LG 补丁组合在 macOS 上通过 **208/208** 项检查，覆盖新增 AUX 背光和时序回退逻辑。实机 HEVC/HDR 查询方法见 [诊断工具说明](tools/diagnostics/README.md)。
+运行上游 CPU 测试前，再应用 `patches/WhateverXe-0.8.0-lg-tests.patch` 和 `patches/WhateverXe-0.8.0-aux-backlight-tests.patch`（只适配测试夹具，不改运行时代码），然后执行 `python3 tools/test.py`。当前 0.8.0 + LG 补丁组合在 macOS 上通过 **208/208** 项检查，覆盖新增 AUX 背光和时序回退逻辑。实机 HEVC/HDR 查询方法见 [诊断工具说明](tools/diagnostics/README.md)。
+
+AUX 背光补丁的实机验证：同一台机器在 15 分钟自动关屏并唤醒后，修复前亮度调节失效，修复后亮度调节正常；两次 HEVC Main/Main10 强制硬解均为 96/96 帧、零错误。
 
 ### 2. 触控板开机后不响应（`patches/VoodooI2CHID-*.patch`）
 
@@ -321,7 +323,7 @@ EFI 里的二进制和补丁过的组件，版权都归原作者，按各自的�
 OpenCore 1.0.8 EFI for the **LG gram Style 16 (16Z90RS, i5-1340P, Iris Xe A7A0, 3200×2000 120 Hz OLED)** running **macOS Sequoia 15.8.2**, SMBIOS MacBookPro16,2. SMBIOS identifiers in `config.plist` are placeholders: generate your own.
 
 **Working**:
-- Iris Xe acceleration (WhateverXe 0.8.0 + the eDP/DPCD-backlight patch in `patches/`, plus WhateverXe Graphics 0.4.1), 120 Hz HiDPI and brightness, including Fn keys
+- Iris Xe acceleration (WhateverXe 0.8.0 + the eDP/DPCD-backlight patch in `patches/`, plus WhateverXe Graphics 0.4.1), 120 Hz HiDPI and brightness, including Fn keys; brightness remains adjustable after an automatic display-off/wake cycle (the DPCD AUX mode/enable is re-asserted on every change)
 - Display off/on, which needs the Apple TGL framebuffer boot-args `-nodisplaysleepDC6 -nopsr`; without them waking the display ends in a display-interrupt storm and a hard freeze
 - I2C touchpad (VoodooI2C CI + a VoodooI2CHID patch that writes the PTP Selective Reporting feature with its full 2-byte payload)
 - Speakers (`tools/audio` initialises the 4 smart amps), Wi-Fi (AirportItlwm), Bluetooth (lshbluesky IntelBluetoothFirmware 2.5.3 + an Intel-only IntelBTPatcher filter), NVMe and battery

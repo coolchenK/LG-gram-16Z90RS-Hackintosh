@@ -1,0 +1,100 @@
+--- a/WhateverXe/kern_xe.cpp	2026-11-08 06:24:07
++++ b/WhateverXe/kern_xe.cpp	2026-11-09 01:58:52
+@@ -9457,42 +9457,56 @@
+ static mach_vm_address_t display13ReadAUXFn {},display13WriteAUXFn {};
+ static bool display13AuxReady {},display13AuxWide {},display13AuxEnable {},display13AuxEnabled {};
+ static uint32_t display13AuxMax {},display13AuxCalls {};
++static uint32_t display13AuxSetCalls {},display13AuxSetFailures {},display13AuxLastState {},display13AuxLastResult {};
+ static __attribute__((noinline)) bool display13AuxBacklightSet(uint32_t brightness) {
+     auto port=display13AuxPort;
+     if(!port || !display13ReadAUXFn || !display13WriteAUXFn || brightness>65535)return false;
+     using AUXFn=uint32_t (*)(void *,uint32_t,void *,uint32_t);
+     const auto rd=reinterpret_cast<AUXFn>(display13ReadAUXFn),wr=reinterpret_cast<AUXFn>(display13WriteAUXFn);
+     if(!display13AuxReady) {
+-        uint8_t cap[3] {},mode=0,bits[3] {};
+-        const auto rc=rd(port,0x701,cap,3),rm=rd(port,0x721,&mode,1),rb=rd(port,0x724,bits,3);
++        uint8_t cap[3] {},bits[3] {};
++        const auto rc=rd(port,0x701,cap,3),rb=rd(port,0x724,bits,3);
+         display13AuxWide=(cap[1]&4)!=0;display13AuxEnable=(cap[0]&4)!=0;
+         uint32_t pn=bits[0]&0x1F;if(!pn)pn=bits[2]&0x1F;
+         if(!pn || pn>16)pn=display13AuxWide?16:8;
+         if(!display13AuxWide && pn>8)pn=8;
+         display13AuxMax=(1U<<pn)-1;
+-        SYSLOG("igfx","Display13 AUX backlight caps rc=%x/%x/%x cap=%02x %02x %02x mode=%02x bits=%02x %02x %02x max=%u",
+-            rc,rm,rb,cap[0],cap[1],cap[2],mode,bits[0],bits[1],bits[2],display13AuxMax);
+-        if(rc || rm || !(cap[1]&2))return false; // BRIGHTNESS_AUX_SET_CAP
+-        if((mode&3)!=2) {
+-            uint8_t m=uint8_t((mode&~3U)|2U);const auto rw=wr(port,0x721,&m,1);
+-            SYSLOG("igfx","Display13 AUX backlight mode %02x -> %02x rc=%x",mode,m,rw);
+-            if(rw)return false;
+-        }
++        SYSLOG("igfx","Display13 AUX backlight caps rc=%x/%x cap=%02x %02x %02x bits=%02x %02x %02x max=%u",
++            rc,rb,cap[0],cap[1],cap[2],bits[0],bits[1],bits[2],display13AuxMax);
++        if(rc || !(cap[1]&2))return false; // BRIGHTNESS_AUX_SET_CAP
+         display13AuxReady=true;
+     }
++    // A panel power cycle (display doze/off, DPMS) resets DPCD 0x720/0x721 to
++    // their defaults, so a cached "mode already AUX and enabled" state goes
++    // stale while the screen is lit again. Re-read both adjacent registers on
++    // every brightness change and re-assert AUX mode/enable before writing the
++    // level; otherwise 0x722 writes succeed but the panel keeps PWM control.
++    uint8_t state[3] {}; // 0x720 enable, 0x721 mode, 0x722 brightness MSB
++    const auto rs=rd(port,0x720,state,3);
++    if(rs)return false;
++    if((state[1]&3)!=2) {
++        uint8_t m=uint8_t((state[1]&~3U)|2U);const auto rw=wr(port,0x721,&m,1);
++        SYSLOG("igfx","Display13 AUX backlight mode %02x -> %02x rc=%x",state[1],m,rw);
++        if(rw)return false;
++    }
+     uint32_t level=uint32_t((uint64_t(brightness)*display13AuxMax+32767)/65535);
+     if(brightness && !level)level=1;
+     uint8_t buf[2] {};uint32_t len=1;
+     if(display13AuxWide){buf[0]=uint8_t(level>>8);buf[1]=uint8_t(level);len=2;} else buf[0]=uint8_t(level);
+     const auto r=wr(port,0x722,buf,len);
+-    if(!r && display13AuxEnable && !display13AuxEnabled) {
+-        uint8_t ctl=0;
+-        if(!rd(port,0x720,&ctl,1)) {
+-            if(!(ctl&1)){ctl|=1;wr(port,0x720,&ctl,1);}
+-            display13AuxEnabled=true;
+-        }
++    // Enable only after the level was accepted; a failed level write must not
++    // report success or leave an enable side effect behind.
++    if(!r && display13AuxEnable && !(state[0]&1)) {
++        uint8_t ctl=uint8_t(state[0]|1);const auto re=wr(port,0x720,&ctl,1);
++        SYSLOG("igfx","Display13 AUX backlight enable %02x -> %02x rc=%x",state[0],ctl,re);
++        if(re)return false;
++        display13AuxEnabled=true;
+     }
+-    if(display13AuxCalls++<8)SYSLOG("igfx","Display13 AUX backlight brightness=%u level=%u/%u rc=%x",brightness,level,display13AuxMax,r);
++    __atomic_store_n(&display13AuxLastState,uint32_t(state[0])|(uint32_t(state[1])<<8)|(uint32_t(state[2])<<16),__ATOMIC_RELAXED);
++    __atomic_store_n(&display13AuxLastResult,static_cast<uint32_t>(r)|(display13AuxWide?0x100U:0U),__ATOMIC_RELAXED);
++    __atomic_add_fetch(&display13AuxSetCalls,1U,__ATOMIC_RELAXED);
++    if(r)__atomic_add_fetch(&display13AuxSetFailures,1U,__ATOMIC_RELAXED);
++    if(display13AuxCalls++<8)SYSLOG("igfx","Display13 AUX backlight brightness=%u level=%u/%u rc=%x state=%02x/%02x/%02x",brightness,level,display13AuxMax,r,state[0],state[1],state[2]);
+     return !r;
+ }
+ 
+@@ -13708,6 +13722,15 @@
+  }
+  IOLockUnlock(c.lock);
+ }
++static bool display13AuxBacklightSerialize(void *,void *,OSSerialize *serializer) {
++    const uint32_t q[] {286,__atomic_load_n(&display13AuxSetCalls,__ATOMIC_RELAXED),
++        __atomic_load_n(&display13AuxSetFailures,__ATOMIC_RELAXED),
++        __atomic_load_n(&display13AuxLastState,__ATOMIC_RELAXED),
++        __atomic_load_n(&display13AuxLastResult,__ATOMIC_RELAXED),display13AuxMax,
++        static_cast<uint32_t>(display13AuxReady),static_cast<uint32_t>(display13AuxEnabled)};
++    auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
++    const bool ok=data->serialize(serializer);data->release();return ok;
++}
+ uint32_t XE::display13PanelBrightness(void *controller,uint32_t brightness) {
+  if(callbackXE->firmwarePorts.panel.auxBacklight) {
+   if(display13AuxBacklightSet(brightness)) {
+@@ -13881,6 +13904,7 @@
+      display13ReadAUXFn=patcher.solveSymbol(index,"__ZN14AppleIntelPort7readAUXEjPvj",address,size);patcher.clearError();
+      display13WriteAUXFn=patcher.solveSymbol(index,"__ZN14AppleIntelPort8writeAUXEjPvj",address,size);patcher.clearError();
+      SYSLOG("igfx","Display13 AUX backlight read=%llx write=%llx",static_cast<uint64_t>(display13ReadAUXFn),static_cast<uint64_t>(display13WriteAUXFn));
++     if(auto auxRoot=IORegistryEntry::getRegistryRoot())if(auto auxData=OSSerializer::forTarget(nullptr,display13AuxBacklightSerialize)){auxRoot->setProperty("WEXAUXBacklightLive",auxData);auxData->release();}
+     }
+    }
+ 
